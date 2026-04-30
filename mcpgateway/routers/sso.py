@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 # First-Party
+from mcpgateway.common.query_params import QueryErrorCodeSso
 from mcpgateway.config import settings
 from mcpgateway.db import get_db
 from mcpgateway.middleware.rbac import get_current_user_with_permissions, require_permission
@@ -306,11 +307,11 @@ async def handle_sso_callback(
     # '!*%', and our own session-bound state uses '.' as a separator
     # (sso_service._STATE_BINDING_SEPARATOR). Bound length only; downstream token
     # exchange and HMAC verification validate integrity.
-    code: Optional[str] = Query(None, max_length=512, description="Authorization code from SSO provider"),
+    code: Optional[str] = Query(None, max_length=4096, description="Authorization code from SSO provider"),
     state: Optional[str] = Query(None, max_length=128, description="CSRF state parameter"),
     # error values are RFC 6749 Section 4.1.2.1 / 5.2 enum-like snake_case tokens
     # (invalid_request, unauthorized_client, access_denied, ...).
-    error: Optional[str] = Query(None, max_length=100, pattern=r"^[a-zA-Z0-9_]+$", description="OAuth error code"),
+    error: QueryErrorCodeSso = None,
     error_description: Optional[str] = Query(None, max_length=500, description="OAuth error description"),
     request: Request = None,
     response: Response = None,
