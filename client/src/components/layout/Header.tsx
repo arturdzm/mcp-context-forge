@@ -1,8 +1,8 @@
 import { useIntl } from "react-intl";
 import { useAuth } from "../../auth/useAuth";
-import { SidebarTrigger } from "../ui/sidebar";
 import { LanguageSwitcher } from "../ui/LanguageSwitcher";
 import { ThemeToggle } from "../ui/ThemeToggle";
+import { SidebarTrigger } from "../ui/sidebar";
 
 export function Header() {
   const intl = useIntl();
