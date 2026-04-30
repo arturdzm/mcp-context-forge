@@ -9,9 +9,9 @@ Tests for A2A Agent Service functionality.
 
 # Standard
 from datetime import datetime, timezone
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
-import json
 import uuid
 
 # Third-Party
@@ -23,10 +23,13 @@ from mcpgateway.cache.a2a_stats_cache import a2a_stats_cache
 from mcpgateway.config import settings
 from mcpgateway.db import A2AAgent as DbA2AAgent
 from mcpgateway.schemas import A2AAgentCreate, A2AAgentRead, A2AAgentUpdate
-from mcpgateway.services.rust_a2a_runtime import RustA2ARuntimeError
 from mcpgateway.services.a2a_service import A2AAgentError, A2AAgentNameConflictError, A2AAgentNotFoundError, A2AAgentService
 from mcpgateway.services.encryption_service import get_encryption_service
+from mcpgateway.services.rust_a2a_runtime import RustA2ARuntimeError
 from mcpgateway.utils.services_auth import encode_auth
+
+# Local
+from tests.helpers.admin_mocks import install_admin_user
 
 
 @pytest.fixture(autouse=True)
@@ -1016,30 +1019,50 @@ class TestA2AAgentService:
         assert result == {"t1": "One", "t2": "Two"}
         assert service._batch_get_team_names(mock_db, []) == {}
 
-    def test_check_agent_access_variants(self, service):
+    @pytest.mark.asyncio
+    async def test_check_agent_access_variants(self, service):
         """Test access control logic for agent visibility."""
+        mock_db = MagicMock()
         agent = SimpleNamespace(visibility="public", team_id="team-1", owner_email="owner@example.com")
 
-        assert service._check_agent_access(agent, user_email=None, token_teams=None) is True
-        assert service._check_agent_access(agent, user_email=None, token_teams=["x"]) is True
+        assert await service._check_agent_access(mock_db, agent, user_email=None, token_teams=None) is True
+        assert await service._check_agent_access(mock_db, agent, user_email=None, token_teams=["x"]) is True
 
         agent.visibility = "team"
         # Full admin bypass (both None) grants access to team agents
-        assert service._check_agent_access(agent, user_email=None, token_teams=None) is True
+        assert await service._check_agent_access(mock_db, agent, user_email=None, token_teams=None) is True
         # No user context (user_email=None) denies access to non-public agents
-        assert service._check_agent_access(agent, user_email=None, token_teams=["team-1"]) is False
+        assert await service._check_agent_access(mock_db, agent, user_email=None, token_teams=["team-1"]) is False
         # Admin bypass: token_teams=None grants access regardless of user_email
-        assert service._check_agent_access(agent, user_email="admin@example.com", token_teams=None) is True
+        assert await service._check_agent_access(mock_db, agent, user_email="admin@example.com", token_teams=None) is True
         # With user context, team membership grants access
-        assert service._check_agent_access(agent, user_email="someone@example.com", token_teams=["team-1"]) is True
-        assert service._check_agent_access(agent, user_email="someone@example.com", token_teams=["other"]) is False
+        assert await service._check_agent_access(mock_db, agent, user_email="someone@example.com", token_teams=["team-1"]) is True
+        assert await service._check_agent_access(mock_db, agent, user_email="someone@example.com", token_teams=["other"]) is False
 
         agent.visibility = "private"
         # Public-only tokens (token_teams=[]) cannot access private agents even as owner
-        assert service._check_agent_access(agent, user_email="owner@example.com", token_teams=[]) is False
+        assert await service._check_agent_access(mock_db, agent, user_email="owner@example.com", token_teams=[]) is False
         # Team-scoped tokens: owner can access their own private agents
-        assert service._check_agent_access(agent, user_email="owner@example.com", token_teams=["team-1"]) is True
-        assert service._check_agent_access(agent, user_email="other@example.com", token_teams=["team-1"]) is False
+        assert await service._check_agent_access(mock_db, agent, user_email="owner@example.com", token_teams=["team-1"]) is True
+        assert await service._check_agent_access(mock_db, agent, user_email="other@example.com", token_teams=["team-1"]) is False
+
+    @pytest.mark.asyncio
+    async def test_check_agent_access_db_admin_bypass_only_with_unrestricted_token(self, service):
+        """DB admin bypass with token_teams=None: own private allowed, other user's private denied (PR #4341)."""
+        other_users_private = SimpleNamespace(visibility="private", team_id="secret", owner_email="other@example.com")
+        own_private = SimpleNamespace(visibility="private", team_id="secret", owner_email="admin@example.com")
+        mock_db = MagicMock()
+        mock_db.info = {}
+        install_admin_user(mock_db, email="admin@example.com")
+
+        # token_teams=None + admin viewing OWN private → allowed (PR #4341 carve-out for self-access)
+        assert await service._check_agent_access(mock_db, own_private, user_email="admin@example.com", token_teams=None) is True
+        # token_teams=None + admin viewing OTHER user's private → denied (PR #4341 invariant)
+        assert await service._check_agent_access(mock_db, other_users_private, user_email="admin@example.com", token_teams=None) is False
+        # token_teams=["x"] → admin narrowed to team scope, cannot see non-team private
+        assert await service._check_agent_access(mock_db, other_users_private, user_email="admin@example.com", token_teams=["some-team"]) is False
+        # token_teams=[] → admin is public-only, cannot see private
+        assert await service._check_agent_access(mock_db, other_users_private, user_email="admin@example.com", token_teams=[]) is False
 
     def test_apply_visibility_filter(self, service):
         """Test visibility filter branches."""
@@ -2655,7 +2678,31 @@ class TestInvokeAgentEdgeCases:
     async def test_get_agent_card_returns_none_when_agent_missing(self, service, mock_db):
         mock_db.execute.return_value.scalar_one_or_none.return_value = None
 
-        assert service.get_agent_card(mock_db, "missing") is None
+        assert await service.get_agent_card(mock_db, "missing") is None
+
+    async def test_get_agent_card_returns_none_when_visibility_denies(self, service, mock_db):
+        """PR #4341 (S6-a) coverage: in-service gate returns None on visibility deny.
+
+        Exercises a2a_service.py:1155 — the deny path of the gate ``get_agent_card``
+        adopted in cycle 2. A private agent owned by a different user with the
+        anonymous-bypass shape must return None (not raise, not return the card).
+        """
+        agent = SimpleNamespace(
+            name="ag",
+            description="desc",
+            endpoint_url="https://x.com",
+            version=1,
+            protocol_version="1.0",
+            capabilities={},
+            visibility="private",
+            team_id=None,
+            owner_email="other@example.com",
+        )
+        mock_db.execute.return_value.scalar_one_or_none.return_value = agent
+
+        result = await service.get_agent_card(mock_db, "ag", user_email=None, token_teams=None)
+
+        assert result is None
 
     async def test_get_agent_card_builds_capabilities(self, service, mock_db):
         agent = SimpleNamespace(
@@ -2665,10 +2712,13 @@ class TestInvokeAgentEdgeCases:
             version=2,
             protocol_version="1.0",
             capabilities={"streaming": True, "pushNotifications": True, "stateTransitionHistory": False, "skills": [{"id": "s1"}]},
+            visibility="public",
+            team_id=None,
+            owner_email=None,
         )
         mock_db.execute.return_value.scalar_one_or_none.return_value = agent
 
-        result = service.get_agent_card(mock_db, "ag")
+        result = await service.get_agent_card(mock_db, "ag")
 
         assert result["name"] == "ag"
         assert result["capabilities"]["streaming"] is True
@@ -3680,14 +3730,15 @@ class TestCancelTask:
         q.all.return_value = [task] if task is not None else []
         return q
 
-    def test_cancel_active_task(self, service, mock_db):
+    @pytest.mark.asyncio
+    async def test_cancel_active_task(self, service, mock_db):
         """Task found in non-terminal state is set to canceled and returned as wire dict."""
         task = self._make_task("submitted")
         mock_db.query.return_value = self._mock_task_query(task)
         mock_db.commit = MagicMock()
         mock_db.refresh = MagicMock()
 
-        result = service.cancel_task(mock_db, "task-1")
+        result = await service.cancel_task(mock_db, "task-1")
 
         assert task.state == "canceled"
         mock_db.commit.assert_called_once()
@@ -3695,27 +3746,30 @@ class TestCancelTask:
         assert result["id"] == "task-1"
         assert result["status"]["state"] == "canceled"
 
-    def test_cancel_already_terminal_task(self, service, mock_db):
+    @pytest.mark.asyncio
+    async def test_cancel_already_terminal_task(self, service, mock_db):
         """Task already in terminal state is returned as-is without modification."""
         task = self._make_task("completed")
         mock_db.query.return_value = self._mock_task_query(task)
 
-        result = service.cancel_task(mock_db, "task-1")
+        result = await service.cancel_task(mock_db, "task-1")
 
         assert task.state == "completed"
         mock_db.commit.assert_not_called()
         assert result["id"] == "task-1"
         assert result["status"]["state"] == "completed"
 
-    def test_cancel_task_not_found_returns_none(self, service, mock_db):
+    @pytest.mark.asyncio
+    async def test_cancel_task_not_found_returns_none(self, service, mock_db):
         """Returns None when the task does not exist."""
         mock_db.query.return_value = self._mock_task_query(None)
 
-        result = service.cancel_task(mock_db, "missing-task")
+        result = await service.cancel_task(mock_db, "missing-task")
 
         assert result is None
 
-    def test_cancel_task_with_agent_id_filter(self, service, mock_db):
+    @pytest.mark.asyncio
+    async def test_cancel_task_with_agent_id_filter(self, service, mock_db):
         """agent_id parameter adds an extra filter clause."""
         task = self._make_task("submitted")
         mock_query = self._mock_task_query(task)
@@ -3723,12 +3777,13 @@ class TestCancelTask:
         mock_db.commit = MagicMock()
         mock_db.refresh = MagicMock()
 
-        service.cancel_task(mock_db, "task-1", agent_id="agent-1")
+        await service.cancel_task(mock_db, "task-1", agent_id="agent-1")
 
         # filter called: task_id, agent_id, and agent visibility lookup
         assert mock_query.filter.call_count >= 2
 
-    def test_cancel_ambiguous_task_without_agent_id_returns_none(self, service, mock_db):
+    @pytest.mark.asyncio
+    async def test_cancel_ambiguous_task_without_agent_id_returns_none(self, service, mock_db):
         """Two rows with the same ``task_id`` and no ``agent_id`` filter must refuse to guess."""
         task_a = self._make_task("submitted")
         task_a.a2a_agent_id = "agent-a"
@@ -3741,7 +3796,7 @@ class TestCancelTask:
         q.all.return_value = [task_a, task_b]
         mock_db.query.return_value = q
 
-        result = service.cancel_task(mock_db, "shared-task-id")
+        result = await service.cancel_task(mock_db, "shared-task-id")
         assert result is None
         # task_a must not have been cancelled by a "first match wins" policy.
         assert task_a.state == "submitted"
@@ -3755,7 +3810,8 @@ class TestCancelTask:
         mock_agent_q.first.return_value = agent
         mock_db.query.side_effect = [mock_task_q, mock_agent_q]
 
-    def test_cancel_task_hidden_from_wrong_team(self, service, mock_db):
+    @pytest.mark.asyncio
+    async def test_cancel_task_hidden_from_wrong_team(self, service, mock_db):
         """Team-scoped user cannot cancel tasks on a different team's agent."""
         task = self._make_task("submitted")
         agent = MagicMock()
@@ -3764,11 +3820,12 @@ class TestCancelTask:
         agent.owner_email = "other@test.com"
         self._setup_task_and_agent(mock_db, task, agent)
 
-        result = service.cancel_task(mock_db, "task-1", user_email="user@test.com", token_teams=["team-a"])
+        result = await service.cancel_task(mock_db, "task-1", user_email="user@test.com", token_teams=["team-a"])
         assert result is None
 
-    def test_cancel_task_admin_bypass(self, service, mock_db):
-        """Admin can cancel any task regardless of visibility."""
+    @pytest.mark.asyncio
+    async def test_cancel_task_admin_bypass_denies_private(self, service, mock_db):
+        """SECURITY: admin bypass cannot cancel tasks on private agents (Layer 1 visibility applies)."""
         task = self._make_task("submitted")
         agent = MagicMock()
         agent.visibility = "private"
@@ -3777,11 +3834,27 @@ class TestCancelTask:
         mock_db.commit = MagicMock()
         mock_db.refresh = MagicMock()
 
-        result = service.cancel_task(mock_db, "task-1", user_email=None, token_teams=None)
+        result = await service.cancel_task(mock_db, "task-1", user_email=None, token_teams=None)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_cancel_task_admin_bypass_allows_team(self, service, mock_db):
+        """Admin bypass can cancel tasks on team agents (only private is denied)."""
+        task = self._make_task("submitted")
+        agent = MagicMock()
+        agent.visibility = "team"
+        agent.team_id = "team-a"
+        agent.owner_email = "other@test.com"
+        self._setup_task_and_agent(mock_db, task, agent)
+        mock_db.commit = MagicMock()
+        mock_db.refresh = MagicMock()
+
+        result = await service.cancel_task(mock_db, "task-1", user_email=None, token_teams=None)
         assert result is not None
         assert result["status"]["state"] == "canceled"
 
-    def test_cancel_task_public_only_user_denied_for_private(self, service, mock_db):
+    @pytest.mark.asyncio
+    async def test_cancel_task_public_only_user_denied_for_private(self, service, mock_db):
         """Public-only user (empty teams) cannot cancel private agent tasks."""
         task = self._make_task("submitted")
         agent = MagicMock()
@@ -3789,7 +3862,7 @@ class TestCancelTask:
         agent.owner_email = "user@test.com"
         self._setup_task_and_agent(mock_db, task, agent)
 
-        result = service.cancel_task(mock_db, "task-1", user_email="user@test.com", token_teams=[])
+        result = await service.cancel_task(mock_db, "task-1", user_email="user@test.com", token_teams=[])
         assert result is None
 
 
@@ -4607,31 +4680,46 @@ class TestCheckAgentAccessById:
     def mock_db(self):
         return MagicMock(spec=Session)
 
-    def test_deleted_agent_returns_false(self, service, mock_db):
+    @pytest.mark.asyncio
+    async def test_deleted_agent_returns_false(self, service, mock_db):
         """Non-existent agent ID returns False (fail-closed)."""
         mock_db.query.return_value.filter.return_value.first.return_value = None
-        assert service._check_agent_access_by_id(mock_db, "deleted-id", "user@test.com", ["team1"]) is False
+        assert await service._check_agent_access_by_id(mock_db, "deleted-id", "user@test.com", ["team1"]) is False
 
-    def test_public_agent_returns_true(self, service, mock_db):
+    @pytest.mark.asyncio
+    async def test_public_agent_returns_true(self, service, mock_db):
         agent = MagicMock()
         agent.visibility = "public"
         mock_db.query.return_value.filter.return_value.first.return_value = agent
-        assert service._check_agent_access_by_id(mock_db, "agent-1", "user@test.com", ["team1"]) is True
+        assert await service._check_agent_access_by_id(mock_db, "agent-1", "user@test.com", ["team1"]) is True
 
-    def test_private_agent_wrong_owner_returns_false(self, service, mock_db):
+    @pytest.mark.asyncio
+    async def test_private_agent_wrong_owner_returns_false(self, service, mock_db):
         agent = MagicMock()
         agent.visibility = "private"
         agent.owner_email = "other@test.com"
         agent.team_id = "team1"
         mock_db.query.return_value.filter.return_value.first.return_value = agent
-        assert service._check_agent_access_by_id(mock_db, "agent-1", "user@test.com", ["team1"]) is False
+        assert await service._check_agent_access_by_id(mock_db, "agent-1", "user@test.com", ["team1"]) is False
 
-    def test_admin_bypass_returns_true(self, service, mock_db):
+    @pytest.mark.asyncio
+    async def test_admin_bypass_denies_private(self, service, mock_db):
+        """SECURITY: admin bypass (user_email=None, token_teams=None) must NOT grant access to private agents."""
         agent = MagicMock()
         agent.visibility = "private"
         agent.owner_email = "other@test.com"
         mock_db.query.return_value.filter.return_value.first.return_value = agent
-        assert service._check_agent_access_by_id(mock_db, "agent-1", None, None) is True
+        assert await service._check_agent_access_by_id(mock_db, "agent-1", None, None) is False
+
+    @pytest.mark.asyncio
+    async def test_admin_bypass_allows_team(self, service, mock_db):
+        """Admin bypass grants access to team agents (only private is denied)."""
+        agent = MagicMock()
+        agent.visibility = "team"
+        agent.team_id = "team-a"
+        agent.owner_email = "other@test.com"
+        mock_db.query.return_value.filter.return_value.first.return_value = agent
+        assert await service._check_agent_access_by_id(mock_db, "agent-1", None, None) is True
 
 
 class TestVisibleAgentIds:
@@ -4694,6 +4782,43 @@ class TestVisibleAgentIds:
         # token_teams=None but user_email set → NOT admin bypass, runs query
         assert result == ["id-all"]
 
+    def test_db_admin_with_email_runs_filtered_query(self, service, mock_db):
+        """PR #4341 regression: DB-admin (email, None) shape runs the filtered query.
+
+        Previously _visible_agent_ids used ``is_admin_bypass_granted`` which matched
+        the (email, None) DB-admin shape. That bypassed the per-agent visibility
+        filter and let DB admins enumerate other users' private agents via
+        list_tasks / list_push_configs_for_dispatch.
+
+        The hardened assertion below compiles the second ``filter()`` argument and
+        confirms the SQL still scopes to public + team + own-private, and crucially
+        that ``owner_email`` is bound only to the caller (not bypassed or omitted).
+        Without this, a regression that re-introduced the unscoped path could pass
+        a test that only asserted ``result is not None``.
+        """
+        mock_db.info = {}
+        install_admin_user(mock_db, email="admin@test.com")
+        mock_query = MagicMock()
+        mock_db.query.return_value = mock_query
+        mock_query.filter.return_value = mock_query
+        mock_query.all.return_value = [("agent-public",), ("agent-own-private",)]
+
+        result = service._visible_agent_ids(mock_db, user_email="admin@test.com", token_teams=None)
+
+        assert result == ["agent-public", "agent-own-private"]
+
+        # Production code calls .filter(enabled).filter(or_(visibility_filters)).
+        # Capture the visibility predicate (second filter call) and verify shape.
+        filter_calls = mock_query.filter.call_args_list
+        assert len(filter_calls) >= 2, "expected enabled + visibility filters"
+        visibility_clause = filter_calls[1].args[0]
+        compiled = str(visibility_clause.compile(compile_kwargs={"literal_binds": True}))
+
+        assert "visibility = 'public'" in compiled or "'public'" in compiled
+        assert "visibility = 'private'" in compiled or "'private'" in compiled
+        assert "owner_email" in compiled
+        assert "admin@test.com" in compiled, f"private branch must scope owner to caller, got: {compiled}"
+
 
 class TestGetTask:
     """Unit tests for get_task visibility enforcement."""
@@ -4724,16 +4849,18 @@ class TestGetTask:
 
         mock_db.query.side_effect = [mock_query, mock_agent_query]
 
-    def test_task_not_found_returns_none(self, service, mock_db):
+    @pytest.mark.asyncio
+    async def test_task_not_found_returns_none(self, service, mock_db):
         mock_query = MagicMock()
         mock_query.filter.return_value = mock_query
         mock_query.limit.return_value = mock_query
         mock_query.all.return_value = []
         mock_db.query.return_value = mock_query
 
-        assert service.get_task(mock_db, "missing") is None
+        assert await service.get_task(mock_db, "missing") is None
 
-    def test_ambiguous_task_without_agent_id_returns_none(self, service, mock_db):
+    @pytest.mark.asyncio
+    async def test_ambiguous_task_without_agent_id_returns_none(self, service, mock_db):
         """Two matches without agent_id must refuse to guess."""
         task_a = MagicMock()
         task_a.a2a_agent_id = "agent-a"
@@ -4746,7 +4873,7 @@ class TestGetTask:
         mock_query.all.return_value = [task_a, task_b]
         mock_db.query.return_value = mock_query
 
-        assert service.get_task(mock_db, "shared-task-id", user_email=None, token_teams=None) is None
+        assert await service.get_task(mock_db, "shared-task-id", user_email=None, token_teams=None) is None
 
     def _wire_task(self, **overrides):
         """Return a MagicMock with the attributes _task_to_wire needs."""
@@ -4760,19 +4887,35 @@ class TestGetTask:
         t.payload = overrides.get("payload", None)
         return t
 
-    def test_task_visible_to_admin(self, service, mock_db):
-        """Admin bypass (user_email=None, token_teams=None) sees any task."""
+    @pytest.mark.asyncio
+    async def test_task_hidden_from_admin_for_private(self, service, mock_db):
+        """SECURITY: admin bypass cannot see tasks on private agents (Layer 1 visibility)."""
         task = self._wire_task()
         agent = MagicMock()
         agent.visibility = "private"
         agent.owner_email = "other@test.com"
         self._setup_task_query(mock_db, task, agent)
 
-        result = service.get_task(mock_db, "t1", user_email=None, token_teams=None)
+        result = await service.get_task(mock_db, "t1", user_email=None, token_teams=None)
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_task_visible_to_admin_for_team(self, service, mock_db):
+        """Admin bypass sees tasks on team agents (only private is denied)."""
+        task = self._wire_task()
+        agent = MagicMock()
+        agent.visibility = "team"
+        agent.team_id = "team-a"
+        agent.owner_email = "other@test.com"
+        self._setup_task_query(mock_db, task, agent)
+
+        result = await service.get_task(mock_db, "t1", user_email=None, token_teams=None)
 
         assert result["id"] == "t1"
 
-    def test_task_hidden_from_wrong_team(self, service, mock_db):
+    @pytest.mark.asyncio
+    async def test_task_hidden_from_wrong_team(self, service, mock_db):
         """Team-scoped user cannot see tasks owned by agents in a different team."""
         task = MagicMock()
         task.a2a_agent_id = "agent-1"
@@ -4782,11 +4925,12 @@ class TestGetTask:
         agent.owner_email = "other@test.com"
         self._setup_task_query(mock_db, task, agent)
 
-        result = service.get_task(mock_db, "t1", user_email="user@test.com", token_teams=["team-a"])
+        result = await service.get_task(mock_db, "t1", user_email="user@test.com", token_teams=["team-a"])
 
         assert result is None
 
-    def test_task_visible_to_correct_team(self, service, mock_db):
+    @pytest.mark.asyncio
+    async def test_task_visible_to_correct_team(self, service, mock_db):
         """Team-scoped user can see tasks owned by agents in their team."""
         task = self._wire_task()
         agent = MagicMock()
@@ -4795,28 +4939,31 @@ class TestGetTask:
         agent.owner_email = "other@test.com"
         self._setup_task_query(mock_db, task, agent)
 
-        result = service.get_task(mock_db, "t1", user_email="user@test.com", token_teams=["team-a"])
+        result = await service.get_task(mock_db, "t1", user_email="user@test.com", token_teams=["team-a"])
         assert result["id"] == "t1"
 
-    def test_task_visible_when_agent_deleted(self, service, mock_db):
+    @pytest.mark.asyncio
+    async def test_task_visible_when_agent_deleted(self, service, mock_db):
         """If the owning agent was deleted, the task is still returned (agent=None passes the check)."""
         task = self._wire_task(a2a_agent_id="deleted-agent")
         self._setup_task_query(mock_db, task, agent=None)
 
-        result = service.get_task(mock_db, "t1", user_email="user@test.com", token_teams=["team-a"])
+        result = await service.get_task(mock_db, "t1", user_email="user@test.com", token_teams=["team-a"])
         assert result["id"] == "t1"
 
-    def test_public_only_user_sees_public_agent_task(self, service, mock_db):
+    @pytest.mark.asyncio
+    async def test_public_only_user_sees_public_agent_task(self, service, mock_db):
         """Public-only user (empty teams) can see tasks for public agents."""
         task = self._wire_task()
         agent = MagicMock()
         agent.visibility = "public"
         self._setup_task_query(mock_db, task, agent)
 
-        result = service.get_task(mock_db, "t1", user_email="user@test.com", token_teams=[])
+        result = await service.get_task(mock_db, "t1", user_email="user@test.com", token_teams=[])
         assert result["id"] == "t1"
 
-    def test_public_only_user_cannot_see_private_agent_task(self, service, mock_db):
+    @pytest.mark.asyncio
+    async def test_public_only_user_cannot_see_private_agent_task(self, service, mock_db):
         """Public-only user (empty teams) cannot see tasks for private agents."""
         task = MagicMock()
         task.a2a_agent_id = "agent-1"
@@ -4825,7 +4972,7 @@ class TestGetTask:
         agent.owner_email = "user@test.com"
         self._setup_task_query(mock_db, task, agent)
 
-        result = service.get_task(mock_db, "t1", user_email="user@test.com", token_teams=[])
+        result = await service.get_task(mock_db, "t1", user_email="user@test.com", token_teams=[])
 
         assert result is None
 

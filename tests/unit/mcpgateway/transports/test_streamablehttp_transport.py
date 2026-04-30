@@ -27,7 +27,7 @@ from contextlib import asynccontextmanager
 import json
 from types import SimpleNamespace
 from typing import List
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 # Third-Party
 from fastapi import HTTPException
@@ -736,9 +736,12 @@ async def test_call_tool_header_direct_proxy_preserves_is_error(monkeypatch):
     u_token = user_context_var.set({"email": "user@example.com", "teams": ["team1"], "is_authenticated": True, "is_admin": False})
 
     try:
+        # This test verifies is_error preservation, not RBAC.  Bypass the
+        # streamable RBAC check so we exercise the direct-proxy egress path.
         with (
             patch("mcpgateway.transports.streamablehttp_transport.get_db", mock_get_db),
             patch("mcpgateway.transports.streamablehttp_transport.check_gateway_access", AsyncMock(return_value=True)),
+            patch("mcpgateway.transports.streamablehttp_transport._check_streamable_permission", AsyncMock(return_value=True)),
             patch.object(tool_service, "invoke_tool_direct", mock_invoke_direct),
         ):
             result = await call_tool("mytool", {"foo": "bar"})
@@ -893,6 +896,118 @@ async def test_validate_streamable_session_access_skips_when_rust_already_valida
     assert allowed is True
     assert status == 200
     assert detail == ""
+
+
+@pytest.mark.asyncio
+async def test_close_streamable_http_session_removes_registry_and_affinity(monkeypatch):
+    """Session close helper should remove registry state and affinity owner mapping."""
+    session_registry = MagicMock()
+    session_registry.remove_session = AsyncMock(return_value=None)
+
+    mock_affinity = MagicMock()
+    mock_affinity.cleanup_session_owner = AsyncMock(return_value=None)
+
+    monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport._validate_streamable_session_access", AsyncMock(return_value=(True, 200, "")))
+    monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport._get_shared_session_registry", lambda: session_registry)
+
+    with patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_affinity):
+        status_code, payload = await tr._close_streamable_http_session(
+            mcp_session_id="sess-abc",
+            user_context={"email": "owner@example.com", "is_authenticated": True},
+        )
+
+    assert status_code == 200
+    assert payload == {"jsonrpc": "2.0", "result": {}}
+    session_registry.remove_session.assert_awaited_once_with("sess-abc")
+    mock_affinity.cleanup_session_owner.assert_awaited_once_with("sess-abc")
+
+
+@pytest.mark.asyncio
+async def test_close_streamable_http_session_denied(monkeypatch):
+    """Session close helper should return deny payload when ownership check fails."""
+    monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport._validate_streamable_session_access", AsyncMock(return_value=(False, 403, "Session access denied")))
+
+    status_code, payload = await tr._close_streamable_http_session(
+        mcp_session_id="sess-abc",
+        user_context={"email": "attacker@example.com", "is_authenticated": True},
+    )
+
+    assert status_code == 403
+    assert payload == {"detail": "Session access denied"}
+
+
+@pytest.mark.asyncio
+async def test_close_streamable_http_session_registry_none(monkeypatch):
+    """Session close should return 403 when session registry is unavailable."""
+    monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport._validate_streamable_session_access", AsyncMock(return_value=(True, 200, "")))
+    monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport._get_shared_session_registry", lambda: None)
+
+    status_code, payload = await tr._close_streamable_http_session(
+        mcp_session_id="sess-abc",
+        user_context={"email": "user@example.com", "is_authenticated": True},
+    )
+
+    assert status_code == 403
+    assert payload == {"detail": "Session ownership unavailable"}
+
+
+@pytest.mark.asyncio
+async def test_close_streamable_http_session_affinity_runtime_error(monkeypatch):
+    """Session close should succeed when affinity cleanup raises RuntimeError (not initialized)."""
+    session_registry = MagicMock()
+    session_registry.remove_session = AsyncMock(return_value=None)
+
+    monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport._validate_streamable_session_access", AsyncMock(return_value=(True, 200, "")))
+    monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport._get_shared_session_registry", lambda: session_registry)
+
+    with patch("mcpgateway.services.session_affinity.get_session_affinity", side_effect=RuntimeError("not initialized")):
+        status_code, payload = await tr._close_streamable_http_session(
+            mcp_session_id="sess-abc",
+            user_context={"email": "owner@example.com", "is_authenticated": True},
+        )
+
+    assert status_code == 200
+    assert payload == {"jsonrpc": "2.0", "result": {}}
+
+
+@pytest.mark.asyncio
+async def test_close_streamable_http_session_affinity_generic_error(monkeypatch):
+    """Session close should succeed when affinity cleanup raises a non-RuntimeError."""
+    session_registry = MagicMock()
+    session_registry.remove_session = AsyncMock(return_value=None)
+
+    mock_affinity = MagicMock()
+    mock_affinity.cleanup_session_owner = AsyncMock(side_effect=OSError("connection refused"))
+
+    monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport._validate_streamable_session_access", AsyncMock(return_value=(True, 200, "")))
+    monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport._get_shared_session_registry", lambda: session_registry)
+
+    with patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_affinity):
+        status_code, payload = await tr._close_streamable_http_session(
+            mcp_session_id="sess-abc",
+            user_context={"email": "owner@example.com", "is_authenticated": True},
+        )
+
+    assert status_code == 200
+    assert payload == {"jsonrpc": "2.0", "result": {}}
+
+
+@pytest.mark.asyncio
+async def test_close_streamable_http_session_remove_fails(monkeypatch):
+    """Session close should return 500 when remove_session raises."""
+    session_registry = MagicMock()
+    session_registry.remove_session = AsyncMock(side_effect=RuntimeError("redis down"))
+
+    monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport._validate_streamable_session_access", AsyncMock(return_value=(True, 200, "")))
+    monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport._get_shared_session_registry", lambda: session_registry)
+
+    status_code, payload = await tr._close_streamable_http_session(
+        mcp_session_id="sess-abc",
+        user_context={"email": "user@example.com", "is_authenticated": True},
+    )
+
+    assert status_code == 500
+    assert payload == {"detail": "Failed to close session"}
 
 
 @pytest.mark.asyncio
@@ -4756,7 +4871,7 @@ async def test_complete_exception(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_streamable_http_auth_proxy_user_when_client_auth_disabled(monkeypatch):
-    """Test auth sets user context for proxy user when client auth disabled (lines 1740-1750)."""
+    """Proxy user with valid DB record authenticates and gets DB-backed team/admin context."""
     monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport.settings.mcp_client_auth_enabled", False)
     monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport.settings.trust_proxy_auth", True)
     monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport.settings.trust_proxy_auth_dangerously", True)
@@ -4773,7 +4888,22 @@ async def test_streamable_http_auth_proxy_user_when_client_auth_disabled(monkeyp
     async def send(msg):
         sent.append(msg)
 
-    result = await streamable_http_auth(scope, None, send)
+    mock_user = Mock()
+    mock_user.is_admin = False
+    mock_user.is_active = True
+    mock_user.email = "proxy_user@example.com"
+
+    with (
+        patch("mcpgateway.db.get_db") as mock_get_db,
+        patch("mcpgateway.services.email_auth_service.EmailAuthService") as mock_auth_service,
+        patch("mcpgateway.auth._resolve_teams_from_db", new_callable=AsyncMock) as mock_resolve_teams,
+    ):
+        mock_get_db.return_value = iter([Mock()])
+        mock_auth_service.return_value.get_user_by_email = AsyncMock(return_value=mock_user)
+        mock_resolve_teams.return_value = []
+
+        result = await streamable_http_auth(scope, None, send)
+
     assert result is True
     assert sent == []  # No 401 sent
 
@@ -4809,7 +4939,22 @@ async def test_streamable_http_auth_proxy_user_with_bearer_header(monkeypatch):
     async def send(msg):
         sent.append(msg)
 
-    result = await streamable_http_auth(scope, None, send)
+    mock_user = Mock()
+    mock_user.is_admin = False
+    mock_user.is_active = True
+    mock_user.email = "proxy_fallback@example.com"
+
+    with (
+        patch("mcpgateway.db.get_db") as mock_get_db,
+        patch("mcpgateway.services.email_auth_service.EmailAuthService") as mock_auth_service,
+        patch("mcpgateway.auth._resolve_teams_from_db", new_callable=AsyncMock) as mock_resolve_teams,
+    ):
+        mock_get_db.return_value = iter([Mock()])
+        mock_auth_service.return_value.get_user_by_email = AsyncMock(return_value=mock_user)
+        mock_resolve_teams.return_value = []
+
+        result = await streamable_http_auth(scope, None, send)
+
     assert result is True
     assert sent == []
 
@@ -4817,6 +4962,129 @@ async def test_streamable_http_auth_proxy_user_with_bearer_header(monkeypatch):
     assert user_ctx["email"] == "proxy_fallback@example.com"
     assert user_ctx["teams"] == []
     assert user_ctx["is_admin"] is False
+
+
+# ---------------------------------------------------------------------------
+# Proxy auth: disabled user rejected via _set_proxy_user_context (line 4567, 4727)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_streamable_http_auth_proxy_rejects_disabled_user(monkeypatch):
+    """Disabled user gets 401 'Account disabled' through proxy auth (lines 4567, 4727)."""
+    monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport.settings.mcp_client_auth_enabled", False)
+    monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport.settings.trust_proxy_auth", True)
+    monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport.settings.trust_proxy_auth_dangerously", True)
+    monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport.settings.proxy_user_header", "x-forwarded-user")
+
+    scope = _make_scope(
+        "/servers/1/mcp",
+        headers=[
+            (b"x-forwarded-user", b"disabled@example.com"),
+        ],
+    )
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    mock_user = Mock()
+    mock_user.is_admin = True
+    mock_user.is_active = False
+    mock_user.email = "disabled@example.com"
+
+    with patch("mcpgateway.db.get_db") as mock_get_db, patch("mcpgateway.services.email_auth_service.EmailAuthService") as mock_auth_service:
+        mock_get_db.return_value = iter([Mock()])
+        mock_auth_service.return_value.get_user_by_email = AsyncMock(return_value=mock_user)
+
+        result = await streamable_http_auth(scope, None, send)
+
+    assert result is False
+    starts = [m for m in sent if m.get("type") == "http.response.start"]
+    assert starts and starts[0]["status"] == 401
+    bodies = [m for m in sent if m.get("type") == "http.response.body"]
+    assert bodies and b"Account disabled" in bodies[0]["body"]
+
+
+# ---------------------------------------------------------------------------
+# Proxy auth: admin bypass when user not in DB (lines 4572-4575)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_streamable_http_auth_proxy_admin_bypass_no_db_record(monkeypatch):
+    """Platform admin email gets admin bypass when not in DB and require_user_in_db=False (lines 4572-4575)."""
+    monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport.settings.mcp_client_auth_enabled", False)
+    monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport.settings.trust_proxy_auth", True)
+    monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport.settings.trust_proxy_auth_dangerously", True)
+    monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport.settings.proxy_user_header", "x-forwarded-user")
+    monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport.settings.require_user_in_db", False)
+    monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport.settings.platform_admin_email", "admin@example.com")
+
+    scope = _make_scope(
+        "/servers/1/mcp",
+        headers=[
+            (b"x-forwarded-user", b"admin@example.com"),
+        ],
+    )
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    with patch("mcpgateway.db.get_db") as mock_get_db, patch("mcpgateway.services.email_auth_service.EmailAuthService") as mock_auth_service:
+        mock_get_db.return_value = iter([Mock()])
+        mock_auth_service.return_value.get_user_by_email = AsyncMock(return_value=None)
+
+        result = await streamable_http_auth(scope, None, send)
+
+    assert result is True
+    assert sent == []
+
+    user_ctx = tr.user_context_var.get()
+    assert user_ctx["email"] == "admin@example.com"
+    assert user_ctx["teams"] is None
+    assert user_ctx["is_admin"] is True
+    assert user_ctx["auth_method"] == "proxy"
+
+
+# ---------------------------------------------------------------------------
+# Proxy auth: unknown user rejected (line 4577, 4727)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_streamable_http_auth_proxy_rejects_unknown_user(monkeypatch):
+    """Unknown user (not in DB, not platform admin) gets 401 'User not found' (lines 4577, 4727)."""
+    monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport.settings.mcp_client_auth_enabled", False)
+    monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport.settings.trust_proxy_auth", True)
+    monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport.settings.trust_proxy_auth_dangerously", True)
+    monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport.settings.proxy_user_header", "x-forwarded-user")
+    monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport.settings.require_user_in_db", True)
+    monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport.settings.platform_admin_email", "admin@example.com")
+
+    scope = _make_scope(
+        "/servers/1/mcp",
+        headers=[
+            (b"x-forwarded-user", b"unknown@example.com"),
+        ],
+    )
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    with patch("mcpgateway.db.get_db") as mock_get_db, patch("mcpgateway.services.email_auth_service.EmailAuthService") as mock_auth_service:
+        mock_get_db.return_value = iter([Mock()])
+        mock_auth_service.return_value.get_user_by_email = AsyncMock(return_value=None)
+
+        result = await streamable_http_auth(scope, None, send)
+
+    assert result is False
+    starts = [m for m in sent if m.get("type") == "http.response.start"]
+    assert starts and starts[0]["status"] == 401
+    bodies = [m for m in sent if m.get("type") == "http.response.body"]
+    assert bodies and b"User not found in database" in bodies[0]["body"]
 
 
 @pytest.mark.asyncio
@@ -4845,7 +5113,22 @@ async def test_streamable_http_auth_proxy_user_context_on_valid_jwt(monkeypatch)
     async def send(msg):
         sent.append(msg)
 
-    result = await streamable_http_auth(scope, None, send)
+    mock_user = Mock()
+    mock_user.is_admin = False
+    mock_user.is_active = True
+    mock_user.email = "proxy_user@example.com"
+
+    with (
+        patch("mcpgateway.db.get_db") as mock_get_db,
+        patch("mcpgateway.services.email_auth_service.EmailAuthService") as mock_auth_service,
+        patch("mcpgateway.auth._resolve_teams_from_db", new_callable=AsyncMock) as mock_resolve_teams,
+    ):
+        mock_get_db.return_value = iter([Mock()])
+        mock_auth_service.return_value.get_user_by_email = AsyncMock(return_value=mock_user)
+        mock_resolve_teams.return_value = []
+
+        result = await streamable_http_auth(scope, None, send)
+
     assert result is True
 
     user_ctx = tr.user_context_var.get()
@@ -6926,9 +7209,9 @@ async def test_handle_streamable_http_get_bus_unavailable_returns_503(monkeypatc
     """ADR-052: when the event bus raises after the listener is claimed, return 503 and release the claim."""
     # First-Party
     from mcpgateway.services.session_affinity import (
-        ListenerClaimResult,
         get_session_affinity,
         init_session_affinity,
+        ListenerClaimResult,
     )
     from mcpgateway.transports.server_event_bus import reset_server_event_bus
 
@@ -7240,8 +7523,8 @@ def test_resolve_intercept_target_swallows_service_not_initialized():
     request response. The narrow catch is a deliberate guard.
     """
     # First-Party
-    from mcpgateway.transports.streamablehttp_transport import _resolve_intercept_target  # pylint: disable=import-outside-toplevel
     import mcpgateway.transports.streamablehttp_transport as transport_mod  # pylint: disable=import-outside-toplevel
+    from mcpgateway.transports.streamablehttp_transport import _resolve_intercept_target  # pylint: disable=import-outside-toplevel
 
     # Bypass the cached module ref so the test patches the live import.
     transport_mod._notification_service_module = None
@@ -7485,9 +7768,9 @@ async def test_handle_streamable_http_get_heartbeat_loss_closes_stream_then_recl
     """
     # First-Party
     from mcpgateway.services.session_affinity import (  # pylint: disable=import-outside-toplevel
-        ListenerClaimResult,
         get_session_affinity,
         init_session_affinity,
+        ListenerClaimResult,
     )
     from mcpgateway.transports.server_event_bus import reset_server_event_bus  # pylint: disable=import-outside-toplevel
 
@@ -7551,14 +7834,18 @@ async def test_handle_streamable_http_get_heartbeat_loss_closes_stream_then_recl
 @pytest.mark.asyncio
 async def test_handle_streamable_http_get_replays_from_last_event_id(monkeypatch):
     """ADR-052 resume: ``Last-Event-Id`` causes replay of buffered events on connect."""
-    # First-Party
+    # Third-Party
     from mcp.types import JSONRPCMessage, JSONRPCNotification
+
+    # First-Party
+    from mcpgateway.services.session_affinity import init_session_affinity  # pylint: disable=import-outside-toplevel
     from mcpgateway.transports.server_event_bus import (
         get_server_event_bus,
         reset_server_event_bus,
     )
 
     await reset_server_event_bus()
+    init_session_affinity(enable_notifications=False)
 
     sdk = _CountingSessionManager()
     monkeypatch.setattr(tr, "StreamableHTTPSessionManager", lambda **kwargs: sdk)
@@ -7700,8 +7987,10 @@ async def test_handle_streamable_http_get_preempt_then_reclaim_replays_gap_event
     loses messages whenever a heartbeat-loss preemption races with a
     publish.
     """
-    # First-Party
+    # Third-Party
     from mcp.types import JSONRPCMessage, JSONRPCNotification  # pylint: disable=import-outside-toplevel
+
+    # First-Party
     from mcpgateway.services.session_affinity import (  # pylint: disable=import-outside-toplevel
         get_session_affinity,
         init_session_affinity,
@@ -8739,8 +9028,10 @@ async def test_affinity_disconnect_during_body_read(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_affinity_owner_is_self_non_post_falls_through_to_sdk(monkeypatch):
-    """When owner is current worker but method is not POST, request should fall through to SDK (line 1529->1613)."""
+async def test_stateful_delete_with_session_id_uses_deterministic_close(monkeypatch):
+    """DELETE with session ID should use deterministic close path instead of SDK dispatch."""
+
+    sdk_called = False
 
     class DummySessionManager:
         @asynccontextmanager
@@ -8748,12 +9039,16 @@ async def test_affinity_owner_is_self_non_post_falls_through_to_sdk(monkeypatch)
             yield self
 
         async def handle_request(self, scope, receive, send_func):
-            await send_func({"type": "http.response.start", "status": 200, "headers": []})
-            await send_func({"type": "http.response.body", "body": b"sdk"})
+            nonlocal sdk_called
+            sdk_called = True
 
     monkeypatch.setattr(tr, "StreamableHTTPSessionManager", lambda **kwargs: DummySessionManager())
-    monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport.settings.mcpgateway_session_affinity_enabled", True)
+    monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport.settings.mcpgateway_session_affinity_enabled", False)
     monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport.settings.use_stateful_sessions", True)
+    monkeypatch.setattr(
+        "mcpgateway.transports.streamablehttp_transport._close_streamable_http_session",
+        AsyncMock(return_value=(200, {"jsonrpc": "2.0", "result": {}})),
+    )
 
     wrapper = SessionManagerWrapper()
     await wrapper.initialize()
@@ -8761,21 +9056,11 @@ async def test_affinity_owner_is_self_non_post_falls_through_to_sdk(monkeypatch)
     send, messages = _make_send_collector()
     scope = _make_scope("/mcp", method="DELETE", headers=[(b"mcp-session-id", b"sess-abc")])
 
-    mock_pool = MagicMock()
-    mock_pool.get_session_owner = AsyncMock(return_value="worker-1")  # We own it, but not POST
-
-    mock_session_class = MagicMock()
-    mock_session_class.is_valid_mcp_session_id = MagicMock(return_value=True)
-
-    with (
-        patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_pool),
-        patch("mcpgateway.services.session_affinity.WORKER_ID", "worker-1"),
-        patch("mcpgateway.services.session_affinity.SessionAffinity", mock_session_class),
-    ):
-        await wrapper.handle_streamable_http(scope, _make_receive(b""), send)
+    await wrapper.handle_streamable_http(scope, _make_receive(b""), send)
 
     await wrapper.shutdown()
     assert messages[0]["status"] == 200
+    assert sdk_called is False
 
 
 # ---------------------------------------------------------------------------
@@ -15342,6 +15627,7 @@ class TestProxyReadResourceMetaInjection:
         the output dict has "_meta" as the field key, which is then correctly overwritten with the
         caller-supplied metadata before model_validate is called.
         """
+        # Third-Party
         from mcp.types import ReadResourceRequestParams
 
         meta_data = {"trace_id": "abc", "request_id": "123"}
@@ -15368,6 +15654,7 @@ class TestDirectProxyValidatesMeta:
     @pytest.mark.asyncio
     async def test_read_resource_direct_proxy_rejects_oversized_meta(self, monkeypatch):
         """meta_data must be validated before _proxy_read_resource_to_gateway is called (Finding 1 / CWE-400)."""
+        # First-Party
         from mcpgateway.common.validators import META_MAX_KEYS
         from mcpgateway.transports.streamablehttp_transport import _validate_meta_data
 
@@ -15378,6 +15665,7 @@ class TestDirectProxyValidatesMeta:
     @pytest.mark.asyncio
     async def test_read_resource_direct_proxy_rejects_list_of_dicts_depth_bypass(self, monkeypatch):
         """List-of-dicts depth bypass must be caught before _proxy_read_resource_to_gateway (Finding 1/3 / CWE-400)."""
+        # First-Party
         from mcpgateway.transports.streamablehttp_transport import _validate_meta_data
 
         hidden_depth = {"k": [{"l2": {"l3": "x"}}]}
@@ -15504,8 +15792,8 @@ async def test_dispatch_peek_outcome_intercepted_emits_202():
     # First-Party
     from mcpgateway.transports.streamablehttp_transport import (  # pylint: disable=import-outside-toplevel
         _BodyPeekResult,
-        _PeekDispatchOutcome,
         _dispatch_peek_outcome,
+        _PeekDispatchOutcome,
     )
 
     send, messages = _make_send_collector()
@@ -15533,8 +15821,8 @@ async def test_dispatch_peek_outcome_disconnected_returns_aborted(caplog):
     # First-Party
     from mcpgateway.transports.streamablehttp_transport import (  # pylint: disable=import-outside-toplevel
         _BodyPeekResult,
-        _PeekDispatchOutcome,
         _dispatch_peek_outcome,
+        _PeekDispatchOutcome,
     )
 
     send, messages = _make_send_collector()
@@ -15563,8 +15851,8 @@ async def test_dispatch_peek_outcome_too_large_logs_and_falls_through(caplog):
     # First-Party
     from mcpgateway.transports.streamablehttp_transport import (  # pylint: disable=import-outside-toplevel
         _BodyPeekResult,
-        _PeekDispatchOutcome,
         _dispatch_peek_outcome,
+        _PeekDispatchOutcome,
     )
 
     send, _messages = _make_send_collector()
@@ -15651,8 +15939,8 @@ async def test_handle_get_stream_session_affinity_not_initialized_returns_503(mo
     """Lines 3315, 3320-3327: SessionAffinityNotInitializedError → 503."""
     # First-Party
     import mcpgateway.services.session_affinity as sa_mod  # pylint: disable=import-outside-toplevel
-    from mcpgateway.transports.streamablehttp_transport import _handle_get_stream  # pylint: disable=import-outside-toplevel
     from mcpgateway.transports.server_event_bus import reset_server_event_bus  # pylint: disable=import-outside-toplevel
+    from mcpgateway.transports.streamablehttp_transport import _handle_get_stream  # pylint: disable=import-outside-toplevel
 
     await reset_server_event_bus()
     # Force the "not initialized" condition by clearing the singleton.
@@ -15690,12 +15978,12 @@ async def test_handle_get_stream_claim_unavailable_returns_503(monkeypatch):
     """Lines 3348-3354: ListenerClaimResult.UNAVAILABLE → 503 with retry hint."""
     # First-Party
     from mcpgateway.services.session_affinity import (  # pylint: disable=import-outside-toplevel
-        ListenerClaimResult,
         get_session_affinity,
         init_session_affinity,
+        ListenerClaimResult,
     )
-    from mcpgateway.transports.streamablehttp_transport import _handle_get_stream  # pylint: disable=import-outside-toplevel
     from mcpgateway.transports.server_event_bus import reset_server_event_bus  # pylint: disable=import-outside-toplevel
+    from mcpgateway.transports.streamablehttp_transport import _handle_get_stream  # pylint: disable=import-outside-toplevel
 
     await reset_server_event_bus()
     init_session_affinity(enable_notifications=False)
@@ -15740,8 +16028,8 @@ async def test_handle_get_stream_unreachable_claim_variant_triggers_assert_never
         get_session_affinity,
         init_session_affinity,
     )
-    from mcpgateway.transports.streamablehttp_transport import _handle_get_stream  # pylint: disable=import-outside-toplevel
     from mcpgateway.transports.server_event_bus import reset_server_event_bus  # pylint: disable=import-outside-toplevel
+    from mcpgateway.transports.streamablehttp_transport import _handle_get_stream  # pylint: disable=import-outside-toplevel
 
     await reset_server_event_bus()
     init_session_affinity(enable_notifications=False)
@@ -15778,8 +16066,8 @@ async def test_handle_get_stream_event_gen_handles_backlog_overflow(monkeypatch,
     # First-Party
     from mcpgateway.services.session_affinity import init_session_affinity  # pylint: disable=import-outside-toplevel
     from mcpgateway.transports.server_event_bus import (  # pylint: disable=import-outside-toplevel
-        ListenerBacklogOverflow,
         get_server_event_bus,
+        ListenerBacklogOverflow,
         reset_server_event_bus,
     )
 
@@ -16166,9 +16454,9 @@ async def test_handle_get_stream_gauge_dec_exception_is_logged(monkeypatch, capl
 async def test_handle_get_stream_heartbeat_task_drain_exception_is_logged(monkeypatch, caplog):
     """Lines 3524-3525: a heartbeat-task failure during cleanup is logged, not propagated."""
     # First-Party
-    import mcpgateway.transports.streamablehttp_transport as tr_mod  # pylint: disable=import-outside-toplevel
     from mcpgateway.services.session_affinity import init_session_affinity  # pylint: disable=import-outside-toplevel
     from mcpgateway.transports.server_event_bus import reset_server_event_bus  # pylint: disable=import-outside-toplevel
+    import mcpgateway.transports.streamablehttp_transport as tr_mod  # pylint: disable=import-outside-toplevel
 
     await reset_server_event_bus()
     init_session_affinity(enable_notifications=False)

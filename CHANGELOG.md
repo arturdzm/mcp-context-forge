@@ -2,6 +2,100 @@
 
 > All notable changes to this project will be documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project **adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)**.
 
+## [Unreleased]
+
+### Added
+
+- **🛡️ Content Security – Malicious Pattern Detection (US-3)** ([#4072](https://github.com/IBM/mcp-context-forge/pull/4072), [#538](https://github.com/IBM/mcp-context-forge/issues/538)) – Regex-based scanning for XSS, SQL injection, command injection, and template-injection patterns. Applied on the single **and** bulk create/update paths for resources, prompts, and tools (tool `name`, `description`, and JSON-serialized `inputSchema`). New config: `CONTENT_PATTERN_DETECTION_ENABLED`, `CONTENT_BLOCKED_PATTERNS`, `CONTENT_PATTERN_VALIDATION_MODE` (`strict` | `moderate` | `lenient`). Lenient mode logs every matched pattern in a payload (was: only the first).
+- **🔒 Content Security – Prompt Template Validation (US-4)** ([#4072](https://github.com/IBM/mcp-context-forge/pull/4072), [#538](https://github.com/IBM/mcp-context-forge/issues/538)) – Pre-render validation of prompt templates: balanced-brace check, Jinja2 syntax check, and dangerous-pattern scan (`__import__`, `eval(`, dunders, etc.). New config: `CONTENT_VALIDATE_PROMPT_TEMPLATES`, `CONTENT_BLOCKED_TEMPLATE_PATTERNS`.
+- **⚡ ReDoS Defense for Pattern Scanning** ([#4072](https://github.com/IBM/mcp-context-forge/pull/4072)) – `CONTENT_PATTERN_MAX_SCAN_SIZE` (default 200 KB) caps scan input length deterministically; `CONTENT_PATTERN_REGEX_TIMEOUT` (default 1.0 s) per-pattern. Patterns are pre-compiled once at service init instead of re-compiled per request.
+- **🔐 JWT Token Security – Server-Side Revocation, Idle Timeout, Logout** ([#4371](https://github.com/IBM/mcp-context-forge/pull/4371), [#4317](https://github.com/IBM/mcp-context-forge/issues/4317)) – New `TokenBlocklistService` (Redis-cached, DB-persisted) for immediate JWT invalidation. Idle-timeout enforcement on every authenticated request, with activity tracking in Redis (falls back to JWT `iat` when Redis is unavailable). New `POST /auth/logout` (Bearer auth) and enhanced `POST /admin/logout` (cookie auth) revoke the caller's token in the blocklist before clearing session state. Comprehensive audit-log fields (`security_event`, `security_severity`, `jti`, `reason`) for every revocation/idle-timeout event. New config: `TOKEN_IDLE_TIMEOUT`, `TOKEN_BLOCKLIST_CLEANUP_HOURS`. Addresses X-Force Red audit findings on session-token management.
+
+### ⚠️ Behavior Changes
+
+#### **⏱️ `TOKEN_EXPIRY` default reduced from 10080 minutes (~7 days) to 20 minutes** ([#4371](https://github.com/IBM/mcp-context-forge/pull/4371), [#4317](https://github.com/IBM/mcp-context-forge/issues/4317))
+
+**Impact**: Any deployment that does not set `TOKEN_EXPIRY` explicitly will now issue session tokens that expire after **20 minutes** instead of ~7 days. Existing tokens already in circulation are unaffected (they retain the `exp` claim baked in at issuance), but every newly-issued token after upgrade has the shorter lifetime. Automation that re-uses a single login token for hours or days will start receiving HTTP 401 mid-flight.
+
+**Why**: Short-lived tokens are the primary mitigation for stolen-token replay, per the X-Force Red security audit (#4317). 7-day session tokens were previously called out as a finding. The new default brings the gateway in line with industry guidance (5–20 minutes for session tokens).
+
+**Migration**:
+- **Interactive sessions** — no action needed; the new `/auth/logout` endpoint and idle-timeout enforcement (60 min default) work transparently.
+- **CI/automation that needs longer-lived tokens** — set `TOKEN_EXPIRY` explicitly in `.env` (range: 5–1440 minutes), e.g. `TOKEN_EXPIRY=480` for an 8-hour shift, and pair it with `TOKEN_IDLE_TIMEOUT=0` if the workload bursts after long quiet periods.
+- **Long-running scripts using `mcpgateway.utils.create_jwt_token --exp <minutes>`** — the `--exp` flag is unaffected (it overrides the default).
+
+**Rollback**: Set `TOKEN_EXPIRY=10080` to restore the previous 7-day default.
+
+#### **🧪 Prompt templates are now rendered in a Jinja2 sandbox** ([#4072](https://github.com/IBM/mcp-context-forge/pull/4072))
+
+**Impact**: `prompt_service` now uses `jinja2.sandbox.SandboxedEnvironment` instead of plain `jinja2.Environment`. Templates that previously reached Python internals at render time will raise `PromptError: sandbox rejected unsafe operation`.
+
+**What breaks at render time**:
+- `{{ x.__class__ }}`, `{{ obj.__repr__ }}` and similar attribute traversal into Python internals
+- `{{ ''.join(items) }}` and other calls to non-whitelisted methods
+- Templates relying on `getattr()` chains or hex-escaped attribute access
+
+**Why**: The regex-based template blocklist can only match literals in the template source; Jinja2 SSTI bypasses via hex escapes (`\x5f\x5fclass\x5f\x5f`), `attr()` filter chains, or string concatenation defeat it trivially. `SandboxedEnvironment` is Jinja2's upstream-recommended defense and enforces the restriction at runtime — the regex list stays as a pre-flight hint.
+
+**Migration**: Audit stored prompt templates for attribute access on user-supplied or internal objects. Move reflection-style operations into application code; keep templates focused on data substitution.
+
+**Rollback**: If an emergency rollback is required, revert the one-line change in `mcpgateway/services/prompt_service.py::_get_jinja_env()` and restart. The regex template blocklist will continue to provide the (weaker) prior level of protection.
+
+#### **📏 Content scan-size cap (new rejection path)** ([#4072](https://github.com/IBM/mcp-context-forge/pull/4072))
+
+**Impact**: `detect_malicious_patterns()` now rejects content larger than `CONTENT_PATTERN_MAX_SCAN_SIZE` (default 200 KB) with `ContentPatternError(violation_type="content_too_large_to_scan")` → HTTP 400. This is independent of `CONTENT_MAX_RESOURCE_SIZE`.
+
+**Why**: Hard upper bound on regex execution time is the primary ReDoS defense (CWE-400). The prior thread-based timeout on Python < 3.13 was a soft timeout only — the worker thread could not be killed and kept running in the background after `join()` returned.
+
+**Migration**: If you store resources with body > 200 KB that need pattern scanning, raise `CONTENT_PATTERN_MAX_SCAN_SIZE`. Be aware that larger values raise the ReDoS blast radius proportionally — prefer keeping very large content out of pattern-scanned fields where practical.
+
+#### **🔔 Pattern detection and template validation default to enabled** ([#4072](https://github.com/IBM/mcp-context-forge/pull/4072))
+
+`CONTENT_PATTERN_DETECTION_ENABLED=true` and `CONTENT_VALIDATE_PROMPT_TEMPLATES=true` ship as defaults (in contrast to `CONTENT_STRICT_MIME_VALIDATION=false` which had a soft-launch default for US-2). Existing deployments containing any of the default blocked patterns in stored resources or prompts (e.g. Jinja2 `{{ config }}` access, shell metacharacters, `UNION SELECT`) will start returning 400s on subsequent update calls. Set either flag to `false` temporarily to audit and clean existing content before re-enabling.
+
+#### **🔒 Admin bypass no longer reveals other users' private resources** ([#4323](https://github.com/IBM/mcp-context-forge/issues/4323), [#4341](https://github.com/IBM/mcp-context-forge/pull/4341))
+
+**Action Required for integrators relying on admin-bypass reads of other users' private resources.**
+
+Admin bypass (`is_admin=true` with `teams: null` in the JWT, or dev-mode basic-auth admin) now grants access only to **public** and **team** resources via the public HTTP routes. Another user's private resources (visibility=`private`) are only accessible to their owner — admin bypass can no longer read, update, delete, list, or enumerate another user's private tools, prompts, resources, servers, gateways, or A2A agents.
+
+The service layer additionally implements an own-private carve-out for the DB-resolved admin shape `(email, None)`: a session that resolves to admin in the database AND has not been narrowed by a token scope can still access its own private rows. The verified path that exercises this carve-out today is the trusted internal A2A endpoint (`mcpgateway/main.py::_get_internal_a2a_scope_context`), which forwards the admin email through to the service layer. Other internal/in-process callers will hit the same carve-out *only* if they preserve the email on the `(email, None)` shape; OAuth token refresh, for example, performs its own owner check at `token_storage_service._refresh_access_token` and does not exercise the hybrid branch. The carve-out is **not** reachable from the public HTTP routes: `mcpgateway.auth_context.get_scoped_resource_access_context` collapses HTTP admin requests to `(None, None)`, so a normal browser-driven admin gets the same anonymous-bypass treatment as everyone else and is denied their own private rows on `GET /tools/{my_private_tool}`. Use `team`-scoped tokens or own-the-resource workflows if you need a HTTP admin to see their own private rows directly.
+
+**Enforcement applied at the service layer for:**
+
+- `ToolService.get_tool`, `list_tools`
+- `PromptService.get_prompt`, `get_prompt_details`, `list_prompts`
+- `ResourceService.get_resource_by_id`, `read_resource`, `list_resources`
+- `ServerService.get_server`, `list_servers`
+- `GatewayService.get_gateway`, `list_gateways`
+- `A2AAgentService.get_agent`, `get_agent_by_name`, `get_agent_card`, `cancel_task`, `get_task`
+- `BaseService._apply_access_control` and `BaseService._apply_visibility_scope` (list endpoints inheriting from `BaseService`, plus completion / tag enumeration)
+
+**Behavior for denied access:**
+
+- Direct-ID reads return `404 Not Found` (not 403) to avoid disclosing the existence of private resources.
+- A structured log event (`*_access_denied`, e.g. `tool_access_denied`) is emitted for forensics.
+
+**What's unchanged:**
+
+- Public-resource access for admin bypass — unchanged.
+- Team-resource access for admin bypass — unchanged.
+- Resource owners can still access their own private resources via owner-email matching at the service layer.
+- DB-resolved admin sessions can still see their own private rows via internal / non-HTTP call paths that preserve the admin email on a `(email, None)` shape — the trusted internal A2A endpoint is the verified example today. HTTP admin requests are intentionally collapsed to `(None, None)` and do not fire the own-private carve-out — by design, to avoid HTTP being a stealthy escalation surface.
+- Scoped tokens (`teams: [...]`) continue to use their scoped team list; admin-bypass detection still requires both `is_admin=true` **and** `teams: null`.
+
+**Migration guidance for integrators:**
+
+- Audit tokens/scripts that currently rely on an admin listing or reading another user's private data. Transfer resource ownership or switch them to `team`-scoped visibility if the cross-user access is intentional.
+- If an admin genuinely needs cross-user visibility for an operational scenario, prefer a properly scoped token (`teams: ["<target_team>"]`) over relying on bypass.
+- Callers of `server_service.get_server`, `gateway_service.get_gateway`, `prompt_service.get_prompt_details`, `resource_service.get_resource_by_id`, and `a2a_service.get_agent_by_name`/`get_agent_card` now accept new optional `user_email` / `token_teams` parameters. Omitting them evaluates as admin-bypass (public + team access, other-users' private denied). Call sites in `mcpgateway/main.py` and `mcpgateway/admin.py` have been updated to forward the caller's scope via `get_scoped_resource_access_context` (now in `mcpgateway/auth_context.py`).
+
+**Related security invariants (see `AGENTS.md`):**
+
+- `public` is platform-public scope, not internet-anonymous.
+- Token-team interpretation continues to flow through `normalize_token_teams()` / `resolve_session_teams()` in `mcpgateway/auth.py`.
+- Non-JWT admin (basic-auth / dev-mode) retains unrestricted access to public and team resources, but is now also denied direct reads of other users' private resources.
+
 ## [1.0.0-RC3] - 2026-04-14 - Auth Hardening, Plugin Multi-Tenancy, Rust Runtime & Multi-Arch
 
 ### Overview

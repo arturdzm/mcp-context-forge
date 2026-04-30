@@ -61,21 +61,13 @@ from mcpgateway.db import get_for_update, server_tool_association
 from mcpgateway.db import Tool as DbTool
 from mcpgateway.db import ToolMetric, ToolMetricsHourly
 from mcpgateway.observability import create_child_span, create_span, inject_trace_context_headers, otel_context_active, set_span_attribute, set_span_error
-from mcpgateway.plugins.framework import (
-    GlobalContext,
-    HttpHeaderPayload,
-    PluginContextTable,
-    PluginError,
-    PluginViolationError,
-    ToolHookType,
-    ToolPostInvokePayload,
-    ToolPreInvokePayload,
-)
+from mcpgateway.plugins.framework import GlobalContext, HttpHeaderPayload, PluginContextTable, PluginError, PluginViolationError, ToolHookType, ToolPostInvokePayload, ToolPreInvokePayload, UserContext
 from mcpgateway.plugins.framework.constants import GATEWAY_METADATA, TOOL_METADATA
 from mcpgateway.schemas import AuthenticationValues, ToolCreate, ToolMetrics, ToolRead, ToolUpdate, TopPerformer
 from mcpgateway.services.a2a_protocol import prepare_a2a_invocation
 from mcpgateway.services.audit_trail_service import get_audit_trail_service
 from mcpgateway.services.base_service import BaseService
+from mcpgateway.services.content_security import ContentSecurityService
 from mcpgateway.services.event_service import EventService
 from mcpgateway.services.logging_service import LoggingService
 from mcpgateway.services.metrics_buffer_service import get_metrics_buffer_service
@@ -88,10 +80,12 @@ from mcpgateway.services.rust_a2a_runtime import get_rust_a2a_runtime_client, Ru
 from mcpgateway.services.structured_logger import get_structured_logger
 from mcpgateway.services.team_management_service import TeamManagementService
 from mcpgateway.services.upstream_session_registry import downstream_session_id_from_request_context, get_upstream_session_registry, RegistryNotInitializedError, TransportType
+from mcpgateway.utils.admin_check import is_user_admin
 from mcpgateway.utils.correlation_id import get_correlation_id
 from mcpgateway.utils.create_slug import slugify
 from mcpgateway.utils.display_name import generate_display_name
 from mcpgateway.utils.gateway_access import build_gateway_auth_headers, check_gateway_access, extract_gateway_id_from_headers
+from mcpgateway.utils.identity_propagation import build_identity_headers, build_identity_meta
 from mcpgateway.utils.metrics_common import build_top_performers
 from mcpgateway.utils.pagination import decode_cursor, encode_cursor, unified_paginate
 from mcpgateway.utils.passthrough_headers import compute_passthrough_headers_cached
@@ -210,6 +204,8 @@ _SENSITIVE_TOOL_HEADER_PATTERNS = (
     re.compile(r"^content-length$", re.IGNORECASE),
     re.compile(r"^connection$", re.IGNORECASE),
     re.compile(r"^upgrade$", re.IGNORECASE),
+    # Prevent caller-controllable encoding dispatch via header_mapping (see #4139).
+    re.compile(r"^content-type$", re.IGNORECASE),
 )
 
 
@@ -945,6 +941,7 @@ class ToolService(BaseService):
             request_timeout=int(settings.oauth_request_timeout if hasattr(settings, "oauth_request_timeout") else 30),
             max_retries=int(settings.oauth_max_retries if hasattr(settings, "oauth_max_retries") else 3),
         )
+        self._content_security = ContentSecurityService()
 
     async def initialize(self) -> None:
         """Initialize the service.
@@ -1152,10 +1149,13 @@ class ToolService(BaseService):
         if visibility == "public":
             return True
 
-        # Admin bypass: token_teams=None AND user_email=None means unrestricted admin
-        # This happens when is_admin=True and no team scoping in token
+        # Admin bypass (PR #4341 invariant): never reveal another user's private rows.
+        # Anonymous bypass sees public + team only; a DB-resolved admin session
+        # additionally sees their own private rows. Matches a2a_service._visible_agent_ids.
         if token_teams is None and user_email is None:
-            return True
+            return visibility != "private"
+        if token_teams is None and user_email and is_user_admin(db, user_email):
+            return visibility != "private" or tool_owner_email == user_email
 
         # No user context (but not admin) = deny access to non-public tools
         if not user_email:
@@ -1869,6 +1869,39 @@ class ToolService(BaseService):
 
             if visibility is None:
                 visibility = tool.visibility or "public"
+
+            # Validate tool content for malicious patterns (CWE-20 fix - Issue #6)
+            # Scan tool name, description, and inputSchema
+            # Convert to string to handle both string and non-string inputs
+            if tool.name:
+                self._content_security.detect_malicious_patterns(
+                    content=str(tool.name),
+                    content_type="Tool name",
+                    user_email=owner_email or created_by,
+                    ip_address=created_from_ip,
+                )
+            if tool.description:
+                self._content_security.detect_malicious_patterns(
+                    content=str(tool.description),
+                    content_type="Tool description",
+                    user_email=owner_email or created_by,
+                    ip_address=created_from_ip,
+                )
+            if tool.input_schema:
+                # Convert inputSchema to string for pattern scanning
+                # Handle both dict objects and test mocks gracefully
+                try:
+                    schema_str = orjson.dumps(tool.input_schema).decode()
+                    self._content_security.detect_malicious_patterns(
+                        content=schema_str,
+                        content_type="Tool inputSchema",
+                        user_email=owner_email or created_by,
+                        ip_address=created_from_ip,
+                    )
+                except (TypeError, ValueError):
+                    # Skip validation if schema is not JSON-serializable (e.g., test mocks)
+                    pass
+
             # Check for existing tool with the same name and visibility
             if visibility.lower() == "public":
                 # Check for existing public tool with the same name
@@ -2306,6 +2339,37 @@ class ToolService(BaseService):
                 and either "tool" (DbTool object) or "error" (error message).
         """
         try:
+            # Same three US-3 malicious-pattern scans that register_tool() runs.
+            # Keep these in lock-step with the single-tool path.
+            if tool.name:
+                self._content_security.detect_malicious_patterns(
+                    content=str(tool.name),
+                    content_type="Tool name",
+                    user_email=owner_email or created_by,
+                    ip_address=created_from_ip,
+                )
+            if tool.description:
+                self._content_security.detect_malicious_patterns(
+                    content=str(tool.description),
+                    content_type="Tool description",
+                    user_email=owner_email or created_by,
+                    ip_address=created_from_ip,
+                )
+            if tool.input_schema:
+                try:
+                    schema_str = orjson.dumps(tool.input_schema).decode()
+                    self._content_security.detect_malicious_patterns(
+                        content=schema_str,
+                        content_type="Tool inputSchema",
+                        user_email=owner_email or created_by,
+                        ip_address=created_from_ip,
+                    )
+                except (TypeError, ValueError):
+                    # Mirror register_tool(): skip scan when inputSchema isn't JSON-serializable
+                    # (e.g. MagicMock in tests). Don't hide actual violations - only this narrow
+                    # pre-scan serialization step.
+                    pass
+
             # Extract auth information
             if tool.auth is None:
                 auth_type = None
@@ -3045,22 +3109,29 @@ class ToolService(BaseService):
         requesting_user_email: Optional[str] = None,
         requesting_user_is_admin: bool = False,
         requesting_user_team_roles: Optional[Dict[str, str]] = None,
+        token_teams: Optional[List[str]] = None,
     ) -> ToolRead:
         """
-        Retrieve a tool by its ID.
+        Retrieve a tool by its ID with access control.
 
         Args:
             db (Session): The SQLAlchemy database session.
             tool_id (str): The unique identifier of the tool.
-            requesting_user_email (Optional[str]): Email of the requesting user for header masking.
+            requesting_user_email (Optional[str]): Email of the requesting user for access control.
             requesting_user_is_admin (bool): Whether the requester is an admin.
             requesting_user_team_roles (Optional[Dict[str, str]]): {team_id: role} for the requester.
+                Used only for response masking (``convert_tool_to_read``), not for visibility.
+            token_teams (Optional[List[str]]): JWT-scoped team list used for visibility checks.
+                ``None`` means unrestricted admin (paired with ``requesting_user_email=None``).
+                ``[]`` means public-only scope. ``[...]`` means team-scoped.
+                This is kept separate from ``requesting_user_team_roles`` to avoid the Layer 1
+                visibility check silently widening a scoped token to full DB team membership.
 
         Returns:
             ToolRead: The tool object.
 
         Raises:
-            ToolNotFoundError: If the tool is not found.
+            ToolNotFoundError: If the tool is not found or access is denied.
 
         Examples:
             >>> from mcpgateway.services.tool_service import ToolService
@@ -3076,6 +3147,34 @@ class ToolService(BaseService):
         """
         tool = db.get(DbTool, tool_id)
         if not tool:
+            raise ToolNotFoundError(f"Tool not found: {tool_id}")
+
+        # SECURITY (Layer 1): forward JWT-scoped token_teams; DO NOT widen to DB team roles.
+        is_admin_bypass = requesting_user_is_admin and requesting_user_email is None
+        access_user_email = None if is_admin_bypass else requesting_user_email
+        access_token_teams = None if is_admin_bypass else token_teams
+
+        tool_payload = {
+            "visibility": tool.visibility,
+            "team_id": tool.team_id,
+            "owner_email": tool.owner_email,
+        }
+
+        if not await self._check_tool_access(db, tool_payload, access_user_email, access_token_teams):
+            structured_logger.log(
+                level="INFO",
+                message="Tool access denied",
+                event_type="tool_access_denied",
+                component="tool_service",
+                resource_type="tool",
+                resource_id=str(tool.id),
+                team_id=getattr(tool, "team_id", None),
+                user_email=requesting_user_email,
+                custom_fields={
+                    "visibility": tool.visibility,
+                    "admin_bypass": is_admin_bypass,
+                },
+            )
             raise ToolNotFoundError(f"Tool not found: {tool_id}")
 
         tool_read = self.convert_tool_to_read(
@@ -3151,6 +3250,11 @@ class ToolService(BaseService):
                 with pause_rollup_during_purge(reason=f"purge_tool:{tool_id}"):
                     delete_metrics_in_batches(db, ToolMetric, ToolMetric.tool_id, tool_id)
                     delete_metrics_in_batches(db, ToolMetricsHourly, ToolMetricsHourly.tool_id, tool_id)
+
+            # Clean up server_tool_association rows referencing this tool.
+            # The association table FK has no ondelete cascade, so rows must
+            # be removed explicitly before the tool row can be deleted.
+            db.execute(delete(server_tool_association).where(server_tool_association.c.tool_id == tool_id))
 
             # Use DELETE with rowcount check for database-agnostic atomic delete
             stmt = delete(DbTool).where(DbTool.id == tool_id)
@@ -3414,6 +3518,7 @@ class ToolService(BaseService):
         meta_data: Optional[Dict[str, Any]] = None,
         user_email: Optional[str] = None,
         token_teams: Optional[List[str]] = None,
+        user_context: Optional[UserContext] = None,
     ) -> types.CallToolResult:
         """
         Invoke a tool directly on a remote MCP gateway in direct_proxy mode.
@@ -3429,6 +3534,7 @@ class ToolService(BaseService):
             meta_data: Optional metadata dictionary for additional context (e.g., request ID).
             user_email: Email of the requesting user for access control.
             token_teams: Team IDs from the user's token for access control.
+            user_context: Optional UserContext for identity propagation.
 
         Returns:
             CallToolResult from the remote MCP server (as-is, no normalization).
@@ -3462,6 +3568,11 @@ class ToolService(BaseService):
                     header_value = request_headers.get(header_name.lower()) or request_headers.get(header_name)
                     if header_value:
                         headers[header_name] = header_value
+
+            # Inject identity propagation headers
+            if user_context:
+                headers.update(build_identity_headers(user_context, gateway))
+                meta_data = build_identity_meta(user_context, meta_data, gateway)
 
             gateway_url = gateway.url
 
@@ -3759,7 +3870,11 @@ class ToolService(BaseService):
             runtime_gateway_oauth_config = getattr(gateway, "oauth_config", None)
             if isinstance(runtime_gateway_oauth_config, dict):
                 gateway_oauth_config = runtime_gateway_oauth_config
+        # MCP invoke path: cert params come from the serialized gateway_payload dict
+        # (the ORM session that produced the gateway object may already be closed).
         gateway_ca_cert = gateway_payload.get("ca_certificate") if has_gateway else None
+        gateway_client_cert = gateway_payload.get("client_cert") if has_gateway else None
+        gateway_client_key = gateway_payload.get("client_key") if has_gateway else None
         gateway_id_str = gateway_payload.get("id") if has_gateway else None
 
         if tool is None and has_gateway:
@@ -3800,6 +3915,12 @@ class ToolService(BaseService):
         if not gateway_url:
             return {"eligible": False, "fallbackReason": "missing-gateway-url"}
 
+        # Tracks whether we entered the OAuth authorization_code "no DB token" branch.
+        # When True, the auth requirement is deferred to AFTER tool_pre_invoke hooks
+        # run so plugins (e.g. Vault) can inject auth. The deny-path check below the
+        # plugin invocation enforces the requirement locally with an actionable error.
+        oauth_authcode_no_db_token = False
+
         if has_gateway and gateway_auth_type == "oauth" and isinstance(gateway_oauth_config, dict) and gateway_oauth_config:
             grant_type = gateway_oauth_config.get("grant_type", "client_credentials")
             if grant_type == "authorization_code":
@@ -3816,13 +3937,23 @@ class ToolService(BaseService):
                     if access_token:
                         headers = {"Authorization": f"Bearer {access_token}"}
                     else:
-                        raise ToolInvocationError(f"Please authorize {gateway_name} first. Visit /oauth/authorize/{gateway_id_str} to complete OAuth flow.")
+                        # No DB-stored OAuth token. Defer the auth requirement to after
+                        # tool_pre_invoke hooks run so plugins (e.g. Vault) can inject
+                        # auth headers. The post-hook check below enforces the requirement
+                        # locally with an actionable error if no plugin provides auth.
+                        oauth_authcode_no_db_token = True
+                        headers = {}
+                        logger.info(
+                            "OAuth authorization_code gateway '%s' invoked without DB-stored token; deferring auth check to allow plugin injection",
+                            gateway_name,
+                            extra={"gateway_id": gateway_id_str, "user": app_user_email or "<unknown>"},
+                        )
                 except Exception as e:
                     logger.error(f"Failed to obtain stored OAuth token for gateway {gateway_name}: {e}")
                     raise ToolInvocationError(f"OAuth token retrieval failed for gateway: {str(e)}")
             else:
                 try:
-                    access_token = await self.oauth_manager.get_access_token(gateway_oauth_config)
+                    access_token = await self.oauth_manager.get_access_token(gateway_oauth_config, ca_certificate=gateway_ca_cert, client_cert=gateway_client_cert, client_key=gateway_client_key)
                     headers = {"Authorization": f"Bearer {access_token}"}
                 except Exception as e:
                     logger.error(f"Failed to obtain OAuth access token for gateway {gateway_name}: {e}")
@@ -3879,6 +4010,21 @@ class ToolService(BaseService):
                     for hk, hv in plugin_headers.items():
                         if hk and hv:
                             runtime_headers[str(hk).lower()] = str(hv)
+
+        # Defense in depth: strip X-Vault-Tokens (case-insensitive) from outbound
+        # headers. The Vault plugin removes this header when it processes the token,
+        # but stripping unconditionally prevents leakage when the plugin is disabled,
+        # errors in permissive mode, or the header is mistakenly in passthrough_allowed.
+        runtime_headers = {hk: hv for hk, hv in runtime_headers.items() if hk.lower() != "x-vault-tokens"}
+
+        # OAuth authorization_code deny-path: if we entered the no-DB-token branch
+        # above and no plugin (or other auth source) injected an Authorization header,
+        # fail locally with an actionable error rather than relying on upstream 401.
+        # This restores the original UX directing the user to /oauth/authorize/{id}
+        # while still allowing legitimate plugin-injected auth (e.g. Vault) to satisfy
+        # the requirement.
+        if oauth_authcode_no_db_token and not any(hk.lower() == "authorization" for hk in runtime_headers):
+            raise ToolInvocationError(f"Please authorize {gateway_name} first. Visit /oauth/authorize/{gateway_id_str} to complete OAuth flow.")
 
         runtime_headers = inject_trace_context_headers(runtime_headers)
 
@@ -4439,8 +4585,12 @@ class ToolService(BaseService):
             runtime_gateway_oauth_config = getattr(gateway, "oauth_config", None)
             if isinstance(runtime_gateway_oauth_config, dict):
                 gateway_oauth_config = runtime_gateway_oauth_config
+        # MCP invoke path: cert params come from the serialized gateway_payload dict
+        # (the ORM session that produced the gateway object may already be closed).
         gateway_ca_cert = gateway_payload.get("ca_certificate") if has_gateway else None
         gateway_ca_cert_sig = gateway_payload.get("ca_certificate_sig") if has_gateway else None
+        gateway_client_cert = gateway_payload.get("client_cert") if has_gateway else None
+        gateway_client_key = gateway_payload.get("client_key") if has_gateway else None
         gateway_passthrough = gateway_payload.get("passthrough_headers") if has_gateway else None
         gateway_id_str = gateway_payload.get("id") if has_gateway else None
 
@@ -4655,7 +4805,14 @@ class ToolService(BaseService):
                     # Handle OAuth authentication for REST tools
                     if tool_auth_type == "oauth" and isinstance(tool_oauth_config, dict) and tool_oauth_config:
                         try:
-                            access_token = await self.oauth_manager.get_access_token(tool_oauth_config)
+                            # REST invoke path: gateway ORM object is still attached to the
+                            # active session, so attribute access is safe here.
+                            access_token = await self.oauth_manager.get_access_token(
+                                tool_oauth_config,
+                                ca_certificate=gateway.ca_certificate if gateway else None,
+                                client_cert=gateway.client_cert if gateway else None,
+                                client_key=gateway.client_key if gateway else None,
+                            )
                             headers["Authorization"] = f"Bearer {access_token}"
                         except Exception as e:
                             logger.error(f"Failed to obtain OAuth access token for tool {tool_name_computed}: {e}")
@@ -4687,6 +4844,10 @@ class ToolService(BaseService):
                             worker_id = str(os.getpid())
                             session_short = mcp_session_id[:8] if len(mcp_session_id) >= 8 else mcp_session_id
                             logger.debug(f"[AFFINITY] Worker {worker_id} | Session {session_short}... | Tool: {name} | Normalized MCP-Session-Id → x-mcp-session-id for pool affinity")
+
+                    # Inject identity propagation headers for REST tools
+                    if global_context and global_context.user_context:
+                        headers.update(build_identity_headers(global_context.user_context))
 
                     if plugin_manager and plugin_manager.has_hooks_for(ToolHookType.TOOL_PRE_INVOKE) and not skip_pre_invoke:
                         # Use pre-created Pydantic model from Phase 2 (no ORM access)
@@ -4757,6 +4918,23 @@ class ToolService(BaseService):
 
                     # Use the tool's request_type rather than defaulting to POST (using local variable)
                     method = tool_request_type.upper() if tool_request_type else "POST"
+                    _url_query_params = query_params if not tool_query_mapping else None
+
+                    # Detect body encoding from the final Content-Type header (after auth/plugin/mapping modifications).
+                    # Supports application/x-www-form-urlencoded and multipart/form-data in addition to the default JSON.
+                    _ct_base = next((v for k, v in headers.items() if k.lower() == "content-type"), "").lower().split(";")[0].strip()
+
+                    # For non-GET form-urlencoded and multipart requests without mappings,
+                    # extract URL query params so they are forwarded via params= (query string)
+                    # rather than being silently embedded in the URL or lost.  GET has its own
+                    # extraction below; JSON POST intentionally preserves query params in the URL
+                    # for signed-URL support.
+                    if method != "GET" and not has_query_mapping and not has_header_mapping and _ct_base in ("application/x-www-form-urlencoded", "multipart/form-data"):
+                        parsed = urlparse(final_url)
+                        if parsed.query:
+                            final_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                            _url_query_params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+
                     with create_child_span("tool.gateway_call", {"tool.name": name, "tool.id": tool_id, "tool.integration_type": "REST"}):
                         rest_start_time = time.time()
                         try:
@@ -4778,6 +4956,22 @@ class ToolService(BaseService):
 
                                 payload.update(query_params)
                                 response = await asyncio.wait_for(self._http_client.get(final_url, params=payload, headers=headers), timeout=effective_timeout)
+                            elif _ct_base == "application/x-www-form-urlencoded":
+                                # NOTE: Intentional asymmetry with the JSON/default path below.
+                                # Form-encoded bodies use params= to keep URL query params on the
+                                # query string (semantically correct for form encoding), whereas
+                                # the JSON path merges them into the body via payload.update() for
+                                # backward compatibility and signed-URL support.
+                                form_payload = {k: self._form_value_to_str(v) for k, v in payload.items()}
+                                response = await asyncio.wait_for(self._http_client.request(method, final_url, data=form_payload, params=_url_query_params, headers=headers), timeout=effective_timeout)
+                            elif _ct_base == "multipart/form-data":
+                                # Strip Content-Type so httpx can set it with the correct boundary parameter.
+                                # URL query params forwarded via params= (same asymmetry as form-urlencoded above).
+                                headers_mp = {k: v for k, v in headers.items() if k.lower() != "content-type"}
+                                files_payload = {k: (None, self._form_value_to_str(v)) for k, v in payload.items()}
+                                response = await asyncio.wait_for(
+                                    self._http_client.request(method, final_url, files=files_payload, params=_url_query_params, headers=headers_mp), timeout=effective_timeout
+                                )
                             else:
                                 # For POST/PUT/PATCH/DELETE: Different behavior based on mapping presence
                                 if has_query_mapping or has_header_mapping:
@@ -4883,6 +5077,12 @@ class ToolService(BaseService):
                 elif tool_integration_type == "MCP":
                     transport = tool_request_type.lower() if tool_request_type else "sse"
 
+                    # Tracks whether we entered the OAuth authorization_code "no DB token" branch.
+                    # When True, the auth requirement is deferred to AFTER tool_pre_invoke hooks
+                    # run so plugins (e.g. Vault) can inject auth. The deny-path check below the
+                    # plugin invocation enforces the requirement locally with an actionable error.
+                    oauth_authcode_no_db_token = False
+
                     # Handle OAuth authentication for the gateway (using local variables)
                     # NOTE: Use has_gateway instead of gateway to avoid accessing detached ORM object
                     if has_gateway and gateway_auth_type == "oauth" and isinstance(gateway_oauth_config, dict) and gateway_oauth_config:
@@ -4907,15 +5107,26 @@ class ToolService(BaseService):
                                 if access_token:
                                     headers = {"Authorization": f"Bearer {access_token}"}
                                 else:
-                                    # User hasn't authorized this gateway yet
-                                    raise ToolInvocationError(f"Please authorize {gateway_name} first. Visit /oauth/authorize/{gateway_id_str} to complete OAuth flow.")
+                                    # No DB-stored OAuth token. Defer the auth requirement to after
+                                    # tool_pre_invoke hooks run so plugins (e.g. Vault) can inject
+                                    # auth headers. The post-hook check below enforces the requirement
+                                    # locally with an actionable error if no plugin provides auth.
+                                    oauth_authcode_no_db_token = True
+                                    headers = {}
+                                    logger.info(
+                                        "OAuth authorization_code gateway '%s' invoked without DB-stored token; deferring auth check to allow plugin injection",
+                                        gateway_name,
+                                        extra={"gateway_id": gateway_id_str, "user": app_user_email or "<unknown>"},
+                                    )
                             except Exception as e:
                                 logger.error(f"Failed to obtain stored OAuth token for gateway {gateway_name}: {e}")
                                 raise ToolInvocationError(f"OAuth token retrieval failed for gateway: {str(e)}")
                         else:
                             # For Client Credentials flow, get token directly (no DB needed)
                             try:
-                                access_token = await self.oauth_manager.get_access_token(gateway_oauth_config)
+                                access_token = await self.oauth_manager.get_access_token(
+                                    gateway_oauth_config, ca_certificate=gateway_ca_cert, client_cert=gateway_client_cert, client_key=gateway_client_key
+                                )
                                 headers = {"Authorization": f"Bearer {access_token}"}
                             except Exception as e:
                                 logger.error(f"Failed to obtain OAuth access token for gateway {gateway_name}: {e}")
@@ -4940,6 +5151,11 @@ class ToolService(BaseService):
                             worker_id = str(os.getpid())
                             session_short = mcp_session_id[:8] if len(mcp_session_id) >= 8 else mcp_session_id
                             logger.debug(f"[AFFINITY] Worker {worker_id} | Session {session_short}... | Tool: {name} | Normalized MCP-Session-Id → x-mcp-session-id for pool affinity (MCP transport)")
+
+                    # Inject identity propagation headers and meta for MCP tools
+                    if global_context and global_context.user_context:
+                        headers.update(build_identity_headers(global_context.user_context))
+                        meta_data = build_identity_meta(global_context.user_context, meta_data)
 
                     # mTLS client cert/key: resolve from payload, then override with runtime gateway if available
                     client_cert_from_payload = gateway_payload.get("client_cert") if has_gateway else None
@@ -5442,6 +5658,21 @@ class ToolService(BaseService):
                             if payload.headers is not None:
                                 headers = payload.headers.model_dump()
 
+                    # Defense in depth: strip X-Vault-Tokens (case-insensitive) from outbound
+                    # headers. The Vault plugin removes this header when it processes the token,
+                    # but stripping unconditionally prevents leakage when the plugin is disabled,
+                    # errors in permissive mode, or the header is mistakenly in passthrough_allowed.
+                    headers = {hk: hv for hk, hv in headers.items() if hk.lower() != "x-vault-tokens"}
+
+                    # OAuth authorization_code deny-path: if we entered the no-DB-token branch
+                    # above and no plugin (or other auth source) injected an Authorization header,
+                    # fail locally with an actionable error rather than relying on upstream 401.
+                    # This restores the original UX directing the user to /oauth/authorize/{id}
+                    # while still allowing legitimate plugin-injected auth (e.g. Vault) to satisfy
+                    # the requirement.
+                    if oauth_authcode_no_db_token and not any(hk.lower() == "authorization" for hk in headers):
+                        raise ToolInvocationError(f"Please authorize {gateway_name} first. Visit /oauth/authorize/{gateway_id_str} to complete OAuth flow.")
+
                     with create_child_span("tool.gateway_call", {"tool.name": name, "tool.id": tool_id, "tool.integration_type": "MCP"}):
                         tool_call_result = ToolResult(content=[TextContent(text="", type="text")])
                         if transport == "sse":
@@ -5802,6 +6033,15 @@ class ToolService(BaseService):
                     pass  # Duration already captured above
 
     @staticmethod
+    def _form_value_to_str(v: Any) -> str:
+        """Coerce a payload value to string for form/multipart encoding."""
+        if v is None:
+            return ""
+        if isinstance(v, (dict, list, bool)):
+            return orjson.dumps(v).decode()
+        return str(v)
+
+    @staticmethod
     def _check_tool_name_conflict(db: Session, custom_name: str, visibility: str, tool_id: str, team_id: Optional[str] = None, owner_email: Optional[str] = None) -> None:
         """Raise ToolNameConflictError if another tool with the same name exists in the target visibility scope.
 
@@ -5923,6 +6163,37 @@ class ToolService(BaseService):
                 permission_service = PermissionService(db)
                 if not await permission_service.check_resource_ownership(user_email, tool):
                     raise PermissionError("Only the owner can update this tool")
+
+            # Validate tool content for malicious patterns (CWE-20 fix - Issue #6)
+            # Convert to string to handle both string and non-string inputs
+            if tool_update.name:
+                self._content_security.detect_malicious_patterns(
+                    content=str(tool_update.name),
+                    content_type="Tool name",
+                    user_email=user_email or modified_by,
+                    ip_address=modified_from_ip,
+                )
+            if tool_update.description:
+                self._content_security.detect_malicious_patterns(
+                    content=str(tool_update.description),
+                    content_type="Tool description",
+                    user_email=user_email or modified_by,
+                    ip_address=modified_from_ip,
+                )
+            if tool_update.input_schema:
+                # Convert inputSchema to string for pattern scanning
+                # Handle both dict objects and test mocks gracefully
+                try:
+                    schema_str = orjson.dumps(tool_update.input_schema).decode()
+                    self._content_security.detect_malicious_patterns(
+                        content=schema_str,
+                        content_type="Tool inputSchema",
+                        user_email=user_email or modified_by,
+                        ip_address=modified_from_ip,
+                    )
+                except (TypeError, ValueError):
+                    # Skip validation if schema is not JSON-serializable (e.g., test mocks)
+                    pass
 
             # Track whether a name change occurred (before tool.name is mutated)
             name_is_changing = bool(tool_update.name and tool_update.name != tool.name)

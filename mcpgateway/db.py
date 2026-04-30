@@ -4668,6 +4668,10 @@ class Gateway(Base):
     # - 'direct_proxy': All RPC calls are proxied directly to remote MCP server with no database caching
     gateway_mode: Mapped[str] = mapped_column(String(20), nullable=False, default="cache", comment="Gateway mode: 'cache' (database caching) or 'direct_proxy' (pass-through mode)")
 
+    # Per-gateway identity propagation configuration (JSON)
+    # Overrides global settings when set: {enabled, mode, headers_prefix, sign_claims, allowed_attributes}
+    identity_propagation: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True, comment="Per-gateway identity propagation config overrides")
+
     # Relationship with OAuth tokens
     oauth_tokens: Mapped[List["OAuthToken"]] = relationship("OAuthToken", back_populates="gateway", cascade="all, delete-orphan")
 
@@ -5489,19 +5493,23 @@ class TokenRevocation(Base):
     """Token revocation blacklist for immediate token invalidation.
 
     This model maintains a blacklist of revoked JWT tokens to provide
-    immediate token invalidation capabilities.
+    immediate token invalidation capabilities. Supports automatic cleanup
+    of expired entries and tracks revocation reasons for security auditing.
 
     Attributes:
         jti (str): JWT ID (primary key)
         revoked_at (datetime): Revocation timestamp
         revoked_by (str): Email of user who revoked the token
-        reason (str): Optional reason for revocation
+        reason (str): Optional reason for revocation (logout, idle_timeout, security, token_refresh, etc.)
+        token_expiry (datetime): Original token expiry for cleanup scheduling
+        last_activity (datetime): Last activity timestamp for idle timeout tracking
 
     Examples:
         >>> revocation = TokenRevocation(
         ...     jti="token-uuid-123",
         ...     revoked_by="admin@example.com",
-        ...     reason="Security compromise"
+        ...     reason="logout",
+        ...     token_expiry=datetime.now(timezone.utc) + timedelta(minutes=20)
         ... )
     """
 
@@ -5511,12 +5519,22 @@ class TokenRevocation(Base):
     jti: Mapped[str] = mapped_column(String(36), primary_key=True)
 
     # Revocation details
-    revoked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    revoked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False, index=True)
     revoked_by: Mapped[str] = mapped_column(String(255), ForeignKey("email_users.email"), nullable=False)
     reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
+    # Token lifecycle tracking
+    token_expiry: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    last_activity: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
     # Relationship
     revoker: Mapped["EmailUser"] = relationship("EmailUser")
+
+    # Indexes for efficient cleanup and queries
+    __table_args__ = (
+        Index("idx_token_revocations_expiry_cleanup", "token_expiry"),
+        Index("idx_token_revocations_revoked_at", "revoked_at"),
+    )
 
 
 class SSOProvider(Base):
@@ -6508,6 +6526,11 @@ class AuditTrail(Base):
 
     # Additional context
     context: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+
+    # Identity propagation audit fields
+    auth_method: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)  # bearer, api_key, basic, sso, proxy
+    acting_as: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # service account acting on behalf of user
+    delegation_chain: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)  # chain of delegated identities
 
     __table_args__ = (
         Index("idx_audit_action_time", "action", "timestamp"),

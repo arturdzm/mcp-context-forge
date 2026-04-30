@@ -90,7 +90,6 @@ def _normalize_env_list_vars() -> None:
         "SSO_GOOGLE_ADMIN_DOMAINS",
         "SSO_ENTRA_ADMIN_GROUPS",
         "LOG_DETAILED_SKIP_ENDPOINTS",
-        "TOOL_DESCRIPTION_FORBIDDEN_PATTERNS",
         "CONTENT_ALLOWED_RESOURCE_MIMETYPES",
     ]
     for key in keys:
@@ -340,7 +339,14 @@ class Settings(BaseSettings):
         default=False,
         description="Allow unauthenticated requests to receive platform-admin context when AUTH_REQUIRED=false (dangerous; development-only override).",
     )
-    token_expiry: int = 10080  # minutes
+    # Session token configuration (short-lived for security)
+    token_expiry: int = Field(default=20, ge=5, le=1440, description="Session token expiry in minutes (5-1440). Recommended: 5-20 minutes for security.")  # 20 minutes (was 10080 = 70 days)
+
+    # Idle timeout configuration
+    token_idle_timeout: int = Field(default=60, ge=5, le=1440, description="Maximum idle time in minutes before token requires refresh (5-1440).")  # 60 minutes
+
+    # Token blocklist cleanup
+    token_blocklist_cleanup_hours: int = Field(default=24, ge=1, le=168, description="Hours to retain expired tokens in blocklist before cleanup (1-168).")
 
     require_token_expiration: bool = Field(default=True, description="Require all JWT tokens to have expiration claims (secure default)")
     require_jti: bool = Field(default=True, description="Require JTI (JWT ID) claim in all tokens for revocation support (secure default)")
@@ -518,6 +524,36 @@ class Settings(BaseSettings):
     )
 
     # ===================================
+    # Identity Propagation Configuration
+    # ===================================
+    # Controls how end-user identity is forwarded to upstream MCP servers.
+
+    identity_propagation_enabled: bool = Field(
+        default=False,
+        description="Enable end-user identity propagation to upstream MCP servers",
+    )
+    identity_propagation_mode: Literal["headers", "meta", "both"] = Field(
+        default="both",
+        description="How to propagate identity: 'headers' (HTTP headers), 'meta' (MCP _meta field), 'both'",
+    )
+    identity_propagation_headers_prefix: str = Field(
+        default="X-Forwarded-User",
+        description="Prefix for identity propagation HTTP headers",
+    )
+    identity_sensitive_attributes: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["password_hash", "internal_id", "ssn"],
+        description="User attributes to strip before propagating to upstream servers",
+    )
+    identity_sign_claims: bool = Field(
+        default=False,
+        description="Sign propagated user claims with HMAC for verification",
+    )
+    identity_claims_secret: Optional[str] = Field(
+        default=None,
+        description="Secret key for signing propagated identity claims (uses JWT_SECRET_KEY if unset)",
+    )
+
+    # ===================================
     # SSRF Protection Configuration
     # ===================================
     # Server-Side Request Forgery (SSRF) protection prevents the gateway from being
@@ -615,7 +651,6 @@ class Settings(BaseSettings):
     # OAuth Configuration
     oauth_request_timeout: int = Field(default=30, description="OAuth request timeout in seconds")
     oauth_max_retries: int = Field(default=3, description="Maximum retries for OAuth token requests")
-    oauth_default_timeout: int = Field(default=3600, description="Default OAuth token timeout in seconds")
 
     # ===================================
     # Dynamic Client Registration (DCR) - Client Mode
@@ -696,8 +731,8 @@ class Settings(BaseSettings):
     password_prevent_reuse: bool = Field(default=True, description="Prevent reusing the current password when changing")
     password_max_age_days: int = Field(default=90, description="Password maximum age in days before expiry forces a change")
     # Account Security Configuration
-    max_failed_login_attempts: int = Field(default=10, description="Maximum failed login attempts before account lockout")
-    account_lockout_duration_minutes: int = Field(default=1, description="Account lockout duration in minutes")
+    max_failed_login_attempts: int = Field(default=5, description="Maximum failed login attempts before account lockout")
+    account_lockout_duration_minutes: int = Field(default=60, description="Account lockout duration in minutes")
     account_lockout_notification_enabled: bool = Field(default=True, description="Send lockout notification emails when accounts are locked")
     failed_login_min_response_ms: int = Field(default=250, description="Minimum response duration for failed login attempts to reduce timing side channels")
 
@@ -1706,6 +1741,7 @@ class Settings(BaseSettings):
             "application/xml",
             "application/yaml",
             "application/pdf",
+            "application/octet-stream",
             "image/png",
             "image/jpeg",
             "image/gif",
@@ -1721,6 +1757,79 @@ class Settings(BaseSettings):
     content_strict_mime_validation: bool = Field(
         default=False,
         description="Enable strict MIME type validation for resources (US-2). Set to false to log violations without blocking.",
+    )
+
+    # Content Security - Template Validation (US-4)
+    content_validate_prompt_templates: bool = Field(
+        default=True,
+        description="Enable prompt template validation for syntax and security patterns (US-4). Validates Jinja2 syntax and blocks dangerous patterns.",
+    )
+    content_blocked_template_patterns: List[str] = Field(
+        default_factory=lambda: [
+            r"__import__",  # Python import injection
+            r"__builtins__",  # Access to builtins
+            r"__globals__",  # Access to globals
+            r"__locals__",  # Access to locals
+            r"__class__",  # Class introspection
+            r"__base__",  # Base class access
+            r"__subclasses__",  # Subclass enumeration
+            r"eval\s*\(",  # Eval function
+            r"exec\s*\(",  # Exec function
+            r"compile\s*\(",  # Compile function
+            r"open\s*\(",  # File operations
+            r"file\s*\(",  # File operations
+            r"input\s*\(",  # Input operations
+            r"__\w+__",  # Any dunder method
+        ],
+        description="Regex patterns for dangerous template constructs (US-4). Blocks Python injection attempts in Jinja2 templates.",
+    )
+
+    # Content Security - Malicious Pattern Detection (US-3)
+    content_pattern_detection_enabled: bool = Field(
+        default=True,
+        description="Enable malicious pattern detection in resources and prompts (US-3). Scans for XSS, command injection, SQL injection, and template injection patterns.",
+    )
+    content_pattern_validation_mode: str = Field(
+        default="strict",
+        description="Validation mode for pattern detection (US-3): 'strict' (block), 'moderate' (warn+block), 'lenient' (warn only).",
+    )
+    content_blocked_patterns: List[str] = Field(
+        default_factory=lambda: [
+            # XSS patterns
+            r"<script[^>]*>.*?</script>",  # Script tags
+            r"javascript:",  # JavaScript protocol
+            r"on\w+\s*=",  # Event handlers: onclick, onerror, etc.
+            r"<iframe[^>]*>",  # Iframe injection
+            # Command injection
+            r";\s*rm\s+-rf",  # Dangerous rm command
+            r"&&|\|\|",  # Command chaining
+            r"`[^`]+`",  # Backtick execution
+            r"\$\([^)]+\)",  # Command substitution
+            # SQL injection
+            r"(?i)(union|select|insert|update|delete|drop)\s+",  # SQL keywords
+            r"--\s*$",  # SQL comments
+            r"'\s*or\s*'1'\s*=\s*'1",  # Classic SQL injection
+            # Template injection - more specific patterns to avoid false positives
+            r"\{\{\s*config\s*\}\}",  # Direct Jinja2 config object access (not variables containing "config")
+            r"\{\{\s*config\.",  # Jinja2 config attribute access
+            r"\{%\s*for\s+\w+\s+in\s+config",  # Jinja2 loops over config object
+            r"\$\{.*\}",  # Expression evaluation
+        ],
+        description="Regex patterns for malicious content detection (US-3). Blocks XSS, command injection, SQL injection, and template injection attempts.",
+    )
+    content_pattern_cache_enabled: bool = Field(
+        default=True,
+        description="Enable caching of pattern validation results (US-3). Improves performance by caching validation outcomes.",
+    )
+    content_pattern_max_scan_size: int = Field(
+        default=200_000,
+        ge=1024,
+        description="Maximum bytes of content that will be scanned for malicious patterns (US-3). Content exceeding this limit is rejected with a ContentPatternError. This bounds worst-case regex execution time as hard defense against ReDoS (CWE-400) independent of the per-pattern timeout.",
+    )
+    content_pattern_regex_timeout: float = Field(
+        default=1.0,
+        gt=0.0,
+        description="Per-pattern regex execution timeout in seconds (US-3). Used natively on Python 3.13+ via re.search(..., timeout=) and as a soft thread-join timeout on older Pythons. Primary ReDoS defense is content_pattern_max_scan_size; this is defense-in-depth.",
     )
 
     # Timeout for SSE task group cleanup (seconds).
@@ -1893,6 +2002,20 @@ class Settings(BaseSettings):
     redis_socket_connect_timeout: float = Field(default=2.0, description="Connection timeout in seconds")
     redis_retry_on_timeout: bool = Field(default=True, description="Retry commands on timeout")
     redis_health_check_interval: int = Field(default=30, description="Seconds between connection health checks (0=disabled)")
+
+    redis_operation_timeout: float = Field(
+        default=0.5, gt=0.0, description="Timeout for individual Redis operations in seconds (get/set/delete). " "Should be lower than redis_socket_timeout for faster fallback to in-memory cache."
+    )
+    redis_circuit_failure_threshold: int = Field(
+        default=3,
+        gt=0,
+        description="Consecutive Redis failures (timeouts or connection errors) that trip the circuit breaker and route subsequent calls to the in-memory cache.",
+    )
+    redis_circuit_open_duration: float = Field(
+        default=30.0,
+        gt=0.0,
+        description="Seconds the circuit remains open before a single probe is allowed. A successful probe closes the circuit; a failed probe extends the cooldown.",
+    )
 
     # Redis Leader Election - Multi-Node Deployments
     redis_leader_ttl: int = Field(default=15, description="Leader election TTL in seconds")

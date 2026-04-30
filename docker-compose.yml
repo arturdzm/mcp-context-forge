@@ -96,6 +96,9 @@ services:
       nofile:
         soft: 65535
         hard: 65535
+      nproc:
+        soft: 5000
+        hard: 5000
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost/health"]
       interval: 30s
@@ -198,6 +201,7 @@ services:
       - MCP_RUST_CACHE_PREFIX=${MCP_RUST_CACHE_PREFIX:-mcpgw:}
       - MCP_RUST_DATABASE_URL=${MCP_RUST_DATABASE_URL:-}
       - MCP_RUST_DB_POOL_MAX_SIZE=${MCP_RUST_DB_POOL_MAX_SIZE:-20}
+      - MCP_RUST_MAX_REQUEST_BODY_SIZE_BYTES=${MCP_RUST_MAX_REQUEST_BODY_SIZE_BYTES:-10485760}
       - MCP_RUST_SESSION_CORE_ENABLED=${MCP_RUST_SESSION_CORE_ENABLED:-}
       - MCP_RUST_SESSION_TTL_SECONDS=${MCP_RUST_SESSION_TTL_SECONDS:-3600}
       - MCP_RUST_EVENT_STORE_ENABLED=${MCP_RUST_EVENT_STORE_ENABLED:-}
@@ -439,6 +443,18 @@ services:
       # - SSRF_ALLOW_PRIVATE_NETWORKS=false
       # - SSRF_DNS_FAIL_CLOSED=true
       # - SSRF_ALLOWED_NETWORKS=["10.20.0.0/16"]
+
+      # ═══════════════════════════════════════════════════════════════════════════
+      # Identity Propagation
+      # ═══════════════════════════════════════════════════════════════════════════
+      # Forward end-user identity (email, groups, roles) to upstream MCP servers.
+      # Supports HTTP headers (X-Forwarded-User-*) and MCP _meta field propagation.
+      # - IDENTITY_PROPAGATION_ENABLED=false      # Master switch (default: false)
+      # - IDENTITY_PROPAGATION_MODE=both          # headers, meta, or both
+      # - IDENTITY_PROPAGATION_HEADERS_PREFIX=X-Forwarded-User
+      # - IDENTITY_SENSITIVE_ATTRIBUTES=["password_hash","internal_id","ssn"]
+      # - IDENTITY_SIGN_CLAIMS=false              # HMAC-sign propagated claims
+      # - IDENTITY_CLAIMS_SECRET=                 # uses JWT_SECRET_KEY if unset
 
       # Required for the GET /mcp server-to-client SSE stream (ADR-052).
       # Without this, GET /mcp returns 405 because the gateway has no event
@@ -725,6 +741,9 @@ services:
       nofile:
         soft: 65535
         hard: 65535
+      nproc:
+        soft: 5000
+        hard: 5000
 
     depends_on:          # Default stack: PgBouncer + Redis (PgBouncer depends on Postgres)
       pgbouncer:
@@ -849,6 +868,9 @@ services:
       nofile:
         soft: 8192
         hard: 8192
+      nproc:
+        soft: 5000
+        hard: 5000
     ports:
       - "5433:5432"      # Expose for baseline load testing (5433 to avoid conflict with local postgres)
     # Performance tuning for high-load testing (3000 sustained users)
@@ -981,6 +1003,9 @@ services:
       nofile:
         soft: 65536
         hard: 65536
+      nproc:
+        soft: 5000
+        hard: 5000
     ports:
       - "6432:6432"    # PgBouncer port (optional external access)
     environment:
@@ -1060,6 +1085,9 @@ services:
       nofile:
         soft: 65536
         hard: 65536
+      nproc:
+        soft: 5000
+        hard: 5000
     # Performance tuning for 1000+ RPS high-concurrency load testing
     command:
       - "redis-server"
@@ -1968,6 +1996,9 @@ services:
       nofile:
         soft: 65535
         hard: 65535
+      nproc:
+        soft: 5000
+        hard: 5000
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8880/health"]
       interval: 30s
@@ -2620,6 +2651,9 @@ services:
       nofile:
         soft: 65535
         hard: 65535
+      nproc:
+        soft: 5000
+        hard: 5000
     healthcheck:
       test: ["CMD", "curl", "-fk", "https://localhost/health"]
       interval: 30s
