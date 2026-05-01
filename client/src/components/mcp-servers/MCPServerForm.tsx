@@ -1,14 +1,11 @@
 import { ChevronDown, CircleAlert } from "lucide-react";
-import { useState, type FormEvent } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { MCPIcon } from "@/components/icons/MCPIcon";
 import { AdvancedSettings } from "@/components/mcp-servers/AdvancedSettings";
 import { useRouter } from "@/router";
-
-type TransportType = "sse" | "streamable-http";
-type AuthType = "none" | "basic" | "bearer" | "custom" | "oauth" | "query";
+import { useMCPServerForm, type TransportType } from "@/hooks/useMCPServerForm";
 
 interface NewMCPServerProps {
   isOpen: boolean;
@@ -17,41 +14,43 @@ interface NewMCPServerProps {
 
 export function MCPServerForm({ isOpen, onToggle }: NewMCPServerProps) {
   const { navigate } = useRouter();
-  const [transport, setTransport] = useState<TransportType>("streamable-http");
-  const [name, setName] = useState("");
-  const [url, setUrl] = useState("");
-  const [description, setDescription] = useState("");
-  const [advancedOpen, setAdvancedOpen] = useState(false);
-  const [visibility, setVisibility] = useState("public");
-  const [authType, setAuthType] = useState<AuthType>("none");
-  const [oneTimeAuth, setOneTimeAuth] = useState(false);
-  const [passthroughHeaders, setPassthroughHeaders] = useState("");
-  const [basicAuthUsername, setBasicAuthUsername] = useState("");
-  const [basicAuthPassword, setBasicAuthPassword] = useState("");
-
-  const resetForm = () => {
-    setTransport("streamable-http");
-    setName("");
-    setUrl("");
-    setDescription("");
-    setAdvancedOpen(false);
-    setVisibility("public");
-    setAuthType("none");
-    setOneTimeAuth(false);
-    setPassthroughHeaders("");
-    setBasicAuthUsername("");
-    setBasicAuthPassword("");
-  };
+  const {
+    name,
+    url,
+    description,
+    transport,
+    advancedOpen,
+    visibility,
+    authType,
+    oneTimeAuth,
+    passthroughHeaders,
+    authUsername,
+    authPassword,
+    errors,
+    isValid,
+    isSubmitting,
+    setName,
+    setUrl,
+    setDescription,
+    setTransport,
+    setAdvancedOpen,
+    setVisibility,
+    setAuthType,
+    setOneTimeAuth,
+    setPassthroughHeaders,
+    setAuthUsername,
+    setAuthPassword,
+    handleSubmit,
+  } = useMCPServerForm();
 
   const handleCancel = () => {
     onToggle();
   };
 
-  const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    // Handle form submission
-    onToggle();
-    resetForm();
+  const onSubmit = (event: React.FormEvent<HTMLFormElement>) => {
+    handleSubmit(event, () => {
+      onToggle();
+    });
   };
 
   if (!isOpen) return null;
@@ -87,7 +86,7 @@ export function MCPServerForm({ isOpen, onToggle }: NewMCPServerProps) {
             </p>
           </div>
 
-          <form className="space-y-6" onSubmit={handleSubmit}>
+          <form className="space-y-6" onSubmit={onSubmit}>
             <div className="space-y-3">
               <label className="text-sm font-medium text-neutral-950 dark:text-white">
                 Server transport type
@@ -97,8 +96,8 @@ export function MCPServerForm({ isOpen, onToggle }: NewMCPServerProps) {
                 aria-label="Server transport type"
                 className="flex gap-2 rounded-md bg-neutral-100 p-1 dark:bg-neutral-800"
               >
-                {(["streamable-http", "sse"] as TransportType[]).map((type) => {
-                  const label = type === "streamable-http" ? "Streamable HTTP" : "SSE";
+                {(["STREAMABLEHTTP", "SSE"] as TransportType[]).map((type) => {
+                  const label = type === "STREAMABLEHTTP" ? "Streamable HTTP" : "SSE";
                   return (
                     <div key={type} className="flex-1">
                       <input
@@ -136,7 +135,14 @@ export function MCPServerForm({ isOpen, onToggle }: NewMCPServerProps) {
                 onChange={(event) => setName(event.target.value)}
                 placeholder="Add MCP server name..."
                 className="rounded-md border-neutral-300 bg-white px-4 text-sm text-neutral-900 shadow-none focus-visible:ring-1 focus-visible:ring-ring focus-visible:ring-offset-0 placeholder:text-neutral-400 dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-100 dark:placeholder:text-neutral-500"
+                aria-invalid={!!errors.name}
+                aria-describedby={errors.name ? "name-error" : undefined}
               />
+              {errors.name && (
+                <p id="name-error" className="text-sm text-red-500">
+                  {errors.name}
+                </p>
+              )}
             </div>
 
             <div className="space-y-1">
@@ -154,7 +160,14 @@ export function MCPServerForm({ isOpen, onToggle }: NewMCPServerProps) {
                 onChange={(event) => setUrl(event.target.value)}
                 placeholder="Add URL for a running MCP server..."
                 className="rounded-md border-neutral-300 bg-white px-4 text-sm text-neutral-900 shadow-none focus-visible:ring-1 focus-visible:ring-ring focus-visible:ring-offset-0 placeholder:text-neutral-400 dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-100 dark:placeholder:text-neutral-500"
+                aria-invalid={!!errors.url}
+                aria-describedby={errors.url ? "url-error" : undefined}
               />
+              {errors.url && (
+                <p id="url-error" className="text-sm text-red-500">
+                  {errors.url}
+                </p>
+              )}
             </div>
 
             <div className="space-y-1">
@@ -167,7 +180,14 @@ export function MCPServerForm({ isOpen, onToggle }: NewMCPServerProps) {
                 onChange={(event) => setDescription(event.target.value)}
                 placeholder="Add an optional description..."
                 className="min-h-28 focus-visible:ring-1 focus-visible:ring-offset-0"
+                aria-invalid={!!errors.description}
+                aria-describedby={errors.description ? "description-error" : undefined}
               />
+              {errors.description && (
+                <p id="description-error" className="text-sm text-red-500">
+                  {errors.description}
+                </p>
+              )}
             </div>
 
             <div className="flex flex-col gap-5 pt-2">
@@ -187,10 +207,10 @@ export function MCPServerForm({ isOpen, onToggle }: NewMCPServerProps) {
                   onVisibilityChange={setVisibility}
                   authType={authType}
                   onAuthTypeChange={setAuthType}
-                  basicAuthUsername={basicAuthUsername}
-                  basicAuthPassword={basicAuthPassword}
-                  onBasicAuthUsernameChange={setBasicAuthUsername}
-                  onBasicAuthPasswordChange={setBasicAuthPassword}
+                  basicAuthUsername={authUsername}
+                  basicAuthPassword={authPassword}
+                  onBasicAuthUsernameChange={setAuthUsername}
+                  onBasicAuthPasswordChange={setAuthPassword}
                   oneTimeAuth={oneTimeAuth}
                   onOneTimeAuthChange={setOneTimeAuth}
                   passthroughHeaders={passthroughHeaders}
@@ -199,6 +219,12 @@ export function MCPServerForm({ isOpen, onToggle }: NewMCPServerProps) {
                     console.log("Selected CA certificate files:", files);
                   }}
                 />
+              )}
+
+              {errors.submit && (
+                <div className="rounded-md border border-red-200 bg-red-50 p-3 dark:border-red-900/50 dark:bg-red-950/50">
+                  <p className="text-sm text-red-600 dark:text-red-400">{errors.submit}</p>
+                </div>
               )}
 
               <div className="flex items-center justify-end gap-3 pt-6">
@@ -212,9 +238,10 @@ export function MCPServerForm({ isOpen, onToggle }: NewMCPServerProps) {
                 </Button>
                 <Button
                   type="submit"
-                  className="h-10 rounded-md bg-neutral-950 px-4 text-sm font-medium text-white hover:bg-neutral-800 dark:bg-neutral-100 dark:text-neutral-950 dark:hover:bg-neutral-200"
+                  disabled={!isValid || isSubmitting}
+                  className="h-10 rounded-md bg-neutral-950 px-4 text-sm font-medium text-white hover:enabled:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-neutral-100 dark:text-neutral-950 dark:hover:enabled:bg-neutral-200"
                 >
-                  Connect server
+                  {isSubmitting ? "Connecting..." : "Connect server"}
                 </Button>
               </div>
             </div>
